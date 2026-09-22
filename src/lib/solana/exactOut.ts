@@ -101,26 +101,46 @@ export function calculateExactOut(input: ExactOutInput): ExactOutResult {
     fee = 0n;
     steps.push("0 bps tier: gross == net, no fee.");
   } else if (feeBps >= 10000) {
-    // Fee >= 100%: every transfer is capped at maximumFee, so the only way
-    // net == requested is maximumFee == 0. Otherwise impossible.
+    // Fee >= 100%: the proportional fee is at least the whole transfer, so
+    // every fee is capped at maximumFee — a constant for any gross. The
+    // requested net is therefore always deliverable: gross = net + maximumFee
+    // (and when maximumFee is 0, gross = net).
     if (maximumFee === 0n) {
       gross = net;
       fee = 0n;
       steps.push("Fee 100%+ but maximumFee is 0: gross == net.");
     } else {
-      throw new Error(
-        "Fee is 100% or more with a non-zero maximumFee: no gross amount can deliver the requested net.",
+      gross = net + maximumFee;
+      fee = maximumFee;
+      steps.push(
+        `Fee 100%+: the fee is capped at maximumFee (${maximumFee}) for any gross, so gross = net + maximumFee = ${gross}.`,
       );
     }
   } else {
     const bps = BigInt(feeBps);
     const denominator = 10000n - bps;
-    // ceil(net * 10000 / denominator) without floats:
-    gross = (net * 10000n + denominator - 1n) / denominator;
-    fee = calculateFeeForward(gross, feeBps, maximumFee);
-    steps.push(
-      `Inverse-ceil: gross = ceil(net * 10000 / (10000 - bps)) = ${gross}.`,
-    );
+
+    // Derivation-domain guard. The inverse-ceil formula below is only valid
+    // while the fee is the uncapped proportional fee. Once the fee is capped
+    // at maximumFee, delivered net = gross - maximumFee grows 1:1 with gross,
+    // so the answer is a shift, not an inversion. net sits in the capped
+    // region exactly when even gross = net + maximumFee would pay an uncapped
+    // fee above the cap.
+    const uncappedAtShifted = ((net + maximumFee) * bps + 9999n) / 10000n;
+    if (uncappedAtShifted > maximumFee) {
+      gross = net + maximumFee;
+      fee = calculateFeeForward(gross, feeBps, maximumFee);
+      steps.push(
+        `Requested net sits in the maximum-fee-capped region: gross = net + maximumFee = ${gross}.`,
+      );
+    } else {
+      // ceil(net * 10000 / denominator) without floats:
+      gross = (net * 10000n + denominator - 1n) / denominator;
+      fee = calculateFeeForward(gross, feeBps, maximumFee);
+      steps.push(
+        `Inverse-ceil: gross = ceil(net * 10000 / (10000 - bps)) = ${gross}.`,
+      );
+    }
 
     // Fixpoint check: fee is charged on the gross, not on the net. Iterate a
     // bounded number of times; for bps < 10000 this converges in <=2 steps.

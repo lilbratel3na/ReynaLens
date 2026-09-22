@@ -6,6 +6,10 @@ import {
   getExtraAccountMetas,
   resolveExtraAccountMeta,
 } from "@solana/spl-token";
+// The `buffer` polyfill package (same one @solana/web3.js uses). Imported
+// explicitly so `Buffer.alloc` below resolves at runtime in the browser —
+// Vite does not inject a global Buffer.
+import { Buffer } from "buffer";
 import type { AccountMeta } from "@solana/web3.js";
 import {
   ComputeBudgetProgram,
@@ -199,6 +203,15 @@ export async function simulateTransfer(
   feePayer: PublicKey,
 ): Promise<{ ok: boolean; error?: string; logs?: string[] }> {
   try {
+    // compileMessage() throws "Transaction recentBlockhash required" when the
+    // transaction was built without one (which buildTransferTransaction does
+    // on purpose — a blockhash pinned at build time would go stale). Fill it
+    // in here for simulation only; the signing path always fetches a fresh
+    // blockhash afterwards, so this never leaks into the signed transaction.
+    if (!transaction.recentBlockhash) {
+      const { blockhash } = await connection.getLatestBlockhash("confirmed");
+      transaction.recentBlockhash = blockhash;
+    }
     // Simulate via the VersionedTransaction overload with sigVerify=false and
     // replaceRecentBlockhash=true. No partial signing is involved: the wallet
     // adapter signs and broadcasts later. (The legacy (tx, signers) overload

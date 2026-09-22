@@ -921,7 +921,13 @@ export default function AppPage() {
 /* ------------------------------------------------------------------ */
 
 export function applicableTier(m: MintInspection) {
-  const cfg = m.transferFeeConfig!;
+  // Defensive: callers normally guard on transferFeeConfig presence; fall back
+  // to a 0-fee tier rather than dereferencing null at runtime.
+  const cfg = m.transferFeeConfig ?? {
+    currentEpoch: 0,
+    newerTransferFee: { epoch: 0, maximumFee: "0", transferFeeBasisPoints: 0 },
+    olderTransferFee: { epoch: 0, maximumFee: "0", transferFeeBasisPoints: 0 },
+  };
   return cfg.currentEpoch >= cfg.newerTransferFee.epoch
     ? cfg.newerTransferFee
     : cfg.olderTransferFee;
@@ -1372,7 +1378,7 @@ function AmountScreen({
         </div>
         <div className="mt-2 flex items-center justify-between text-[11px] text-muted-foreground">
           <span>
-            Min transferable: {mintInspection ? formatBaseUnits(1n, decimals) : "—"} {asset?.ticker}
+            Smallest deliverable: {mintInspection ? formatBaseUnits(1n, decimals) : "—"} {asset?.ticker} (1 base unit — derived from the live fee rules, not a product minimum)
           </span>
           {maxDeliverable !== null && (
             <span>
@@ -1488,6 +1494,10 @@ function PreviewScreen({
   onContinue: () => void;
 }) {
   const decimals = mintInspection?.decimals ?? 0;
+  // Hard-stop only when the chain has answered and the source account is
+  // missing. An unset balance (no wallet connected / still loading) must NOT
+  // block here.
+  const sourceDefinitelyMissing = balances?.sourceAtaExists === false;
   return (
     <div className="space-y-4">
       <div>
@@ -1532,6 +1542,14 @@ function PreviewScreen({
         />
       </TermPanel>
 
+      {sourceDefinitelyMissing && (
+        <p className="text-[11px] leading-5 text-status-bad">
+          Your wallet has no {asset?.ticker} token account, so this transfer cannot
+          execute. Acquire {asset?.ticker} first — the simulation gate would fail
+          here anyway.
+        </p>
+      )}
+
       {sourceAta && <FullAddressBox address={recipient} />}
       {owner && (
         <p className="text-[10px] text-muted-foreground">
@@ -1543,7 +1561,11 @@ function PreviewScreen({
         <Button variant="outline" className="flex-1" onClick={onBack}>
           <ChevronLeft className="size-4" /> Back
         </Button>
-        <Button className="flex-[2]" onClick={onContinue} disabled={!exactOut}>
+        <Button
+          className="flex-[2]"
+          onClick={onContinue}
+          disabled={!exactOut || sourceDefinitelyMissing}
+        >
           Run simulation gate
         </Button>
       </div>

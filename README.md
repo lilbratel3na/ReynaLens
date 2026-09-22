@@ -36,7 +36,7 @@ Every step reads live mainnet state. Nothing is hardcoded: fee tiers, decimals, 
 Observable-signal checks before you sign — never claims of certainty about intent:
 - **Valid new recipient** — valid address, not previously used by you (not treated as suspicious).
 - **Verified recipient** — you have previously used this address (per-user recipient book).
-- **Lookalike address** — the address resembles a previous recipient but is not identical. ReynaLens shows the differing characters and warns about address-poisoning / copy-paste substitution. You can *Use previous address* or *I verified this address*.
+- **Lookalike address** — the address resembles a previous recipient or the sender's own wallet but is not identical. ReynaLens shows the differing characters and warns about address-poisoning / copy-paste substitution. You can *Use previous address* or *I verified this address*.
 - **Invalid recipient** — wrong token program (legacy SPL vs Token-2022), frozen destination account, malformed address.
 
 ### Live Token-2022 inspection
@@ -62,6 +62,7 @@ After confirmation, ReynaLens re-reads the destination token account and proves 
 bun install
 bun run dev          # frontend (Vite)
 bun convex dev       # backend (separate terminal)
+bun run test         # unit tests (exact-out math, shield classification)
 ```
 
 Environment: `VITE_CONVEX_URL` must point at your Convex deployment. No Solana RPC key required — public mainnet endpoints are used by default (swap in `src/lib/solana/connection.ts` for production).
@@ -92,7 +93,7 @@ Token-2022 charges `fee = min(ceil(amount × bps / 10000), maximumFee)` on the *
 
 ### Recipient Shield
 
-Similarity uses Levenshtein distance (with substituted-character diffs) against the user's recipient book. Two to nine edits mark a lookalike; identical addresses are verified recipients. Destination accounts are inspected live for existence, frozen state, and token-program mismatch.
+Similarity uses Levenshtein distance (with substituted-character diffs) against the user's recipient book and the sender's own wallet. One to nine edits mark a lookalike; identical addresses are verified recipients. Destination accounts are inspected live for existence, frozen state, and token-program mismatch.
 
 ## Security model
 

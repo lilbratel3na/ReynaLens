@@ -58,10 +58,7 @@ export interface ShieldKnownRecipient {
   lastUsedAt: number | null;
 }
 
-const D1 = 1;
-const D2 = 2;
-const SUB_COST = 5;
-const LOOKALIKE_MIN_EDITS = 2;
+const LOOKALIKE_MIN_EDITS = 1;
 const LOOKALIKE_MAX_EDITS = 9;
 
 function levenshtein(a: string, b: string): number {
@@ -147,7 +144,6 @@ export async function evaluateRecipientShield(
   }
 
   // 3. Lookalike / known detection against the recipient book
-  const lowercaseSelf = selfAddress.toLowerCase();
   const sortedKnown = [...knownRecipients].sort(
     (a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0),
   );
@@ -167,7 +163,6 @@ export async function evaluateRecipientShield(
         destinationAccount: dest,
       };
     }
-    if (rec.address.toLowerCase() === lowercaseSelf) continue;
     const d = levenshtein(pubkey.toBase58(), rec.address);
     if (!best || d < best.d) best = { rec, d };
   }
@@ -184,6 +179,27 @@ export async function evaluateRecipientShield(
       enteredAddress: pubkey.toBase58(),
       matchedAgainst: best.rec.address,
       matchingAddressLabel: best.rec.label,
+      destinationAccount: dest,
+    };
+  }
+
+  // 3b. Lookalike of the SENDER's own wallet: a classic poisoning target is an
+  // address a character or two away from yours, hoping a truncated copy/paste
+  // lands on the attacker. Observable similarity only — no intent claims.
+  // (Known-recipient matches above take priority; this is the fallback.)
+  const selfDistance = levenshtein(pubkey.toBase58(), selfAddress);
+  if (selfDistance >= LOOKALIKE_MIN_EDITS && selfDistance <= LOOKALIKE_MAX_EDITS) {
+    const diffs = diffPositions(selfAddress, pubkey.toBase58());
+    const dest = await inspectDestination(connection, pubkey, mintPubkey, mint);
+    return {
+      kind: "lookalike",
+      title: "LOOKALIKE ADDRESS DETECTED",
+      detail: `This address resembles your own wallet but is not the same address (${selfDistance} characters differ). This may indicate an address-poisoning or copy/paste substitution attempt. Verify before continuing.`,
+      actions: "confirm_only",
+      diffs,
+      enteredAddress: pubkey.toBase58(),
+      matchedAgainst: selfAddress,
+      matchingAddressLabel: "your wallet",
       destinationAccount: dest,
     };
   }
