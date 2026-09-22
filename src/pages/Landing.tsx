@@ -25,9 +25,9 @@ function Nav() {
       <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-4">
         <a href="/" className="flex items-center gap-2">
           <ScanLine className="size-5 text-primary" />
-          <span className="font-terminal text-sm font-bold tracking-terminal">REYNALENS</span>
+          <span className="text-sm font-semibold tracking-tight">REYNALENS</span>
         </a>
-        <Button asChild size="sm" className="cursor-pointer">
+        <Button asChild size="sm" className="cursor-pointer rounded-full">
           <a href={isAuthenticated ? "/app" : "/auth"}>
             {isAuthenticated ? "Open app" : "Connect wallet"}
             <ArrowRight className="size-3.5" />
@@ -44,19 +44,19 @@ export default function Landing() {
   return (
     <div className="min-h-screen bg-background">
       {isLoading && isAuthenticated ? <Navigate to="/app" replace /> : null}
-      <div className="terminal-grid-faint">
+      <div>
         <Nav />
 
         {/* Hero */}
         <section className="mx-auto max-w-5xl px-4 pb-16 pt-16 sm:pt-24">
           <motion.div {...fadeUp} transition={{ duration: 0.4 }} className="mx-auto max-w-2xl text-center">
-            <div className="mb-4 inline-flex items-center gap-2 border border-border bg-card px-3 py-1">
-              <span className="size-1.5 bg-status-ok" />
-              <span className="text-[11px] uppercase tracking-terminal text-muted-foreground">
+            <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1">
+              <span className="size-1.5 rounded-full bg-status-ok" />
+              <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 Exact-out PreStocks transfers · Token-2022
               </span>
             </div>
-            <h1 className="text-balance font-terminal text-4xl font-bold leading-tight tracking-tight sm:text-5xl">
+            <h1 className="text-balance text-4xl font-bold leading-tight tracking-tight sm:text-5xl">
               Send exactly what you mean.
             </h1>
             <p className="mx-auto mt-4 max-w-xl text-pretty text-sm leading-6 text-muted-foreground sm:text-base">
@@ -83,10 +83,10 @@ export default function Landing() {
             transition={{ duration: 0.4, delay: 0.12 }}
             className="mx-auto mt-14 grid max-w-3xl gap-3 sm:grid-cols-2"
           >
-            <div className="border border-border bg-card p-4">
-              <div className="flex items-center gap-2 text-status-bad">
+            <div className="rounded-2xl border border-border bg-card p-4">
+              <div className="mt-3 flex items-center gap-2 text-status-bad">
                 <Crosshair className="size-4" />
-                <span className="font-terminal text-xs font-bold tracking-terminal">NORMAL WALLET ASKS</span>
+                <span className="text-xs font-semibold tracking-wide">NORMAL WALLET ASKS</span>
               </div>
               <p className="mt-3 text-sm text-muted-foreground">“How many tokens do you want to <span className="font-semibold text-foreground">send</span>?”</p>
               <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
@@ -94,10 +94,10 @@ export default function Landing() {
                 arrives. The recipient gets less — silently.
               </p>
             </div>
-            <div className="border border-status-ok bg-status-ok-soft p-4">
+            <div className="rounded-2xl border border-status-ok bg-status-ok-soft p-4">
               <div className="flex items-center gap-2 text-status-ok">
                 <ShieldCheck className="size-4" />
-                <span className="font-terminal text-xs font-bold tracking-terminal">REYNALENS ASKS</span>
+                <span className="text-xs font-semibold tracking-wide">REYNALENS ASKS</span>
               </div>
               <p className="mt-3 text-sm text-foreground">“How many tokens should the recipient actually <span className="font-semibold">receive</span>?”</p>
               <p className="mt-3 text-[11px] leading-5 text-foreground/80">
@@ -113,8 +113,7 @@ export default function Landing() {
           <div className="mx-auto max-w-5xl px-4 py-16">
             <motion.h2
               {...fadeUp}
-              transition={{ duration: 0.35 }}
-              className="text-center font-terminal text-2xl font-bold tracking-tight"
+              transition={{ duration: 0.35 }}                className="text-center text-2xl font-bold tracking-tight"
             >
               One workflow. Done properly.
             </motion.h2>
@@ -145,10 +144,10 @@ export default function Landing() {
                   key={f.title}
                   {...fadeUp}
                   transition={{ duration: 0.35, delay: 0.06 * i }}
-                  className="border border-border bg-card p-4"
+                  className="rounded-2xl border border-border bg-card p-4"
                 >
                   <f.icon className="size-5 text-primary" />
-                  <h3 className="mt-3 font-terminal text-sm font-bold tracking-terminal">{f.title}</h3>
+                  <h3 className="mt-3 text-sm font-semibold">{f.title}</h3>
                   <p className="mt-2 text-xs leading-5 text-muted-foreground">{f.body}</p>
                 </motion.div>
               ))}
@@ -161,13 +160,13 @@ export default function Landing() {
           <div className="mx-auto max-w-5xl px-4 py-16">
             <div className="grid items-center gap-8 lg:grid-cols-2">
               <motion.div {...fadeUp} transition={{ duration: 0.35 }}>
-                <div className="inline-flex items-center gap-2 border border-status-warn bg-status-warn-soft px-2.5 py-1">
+                <div className="inline-flex items-center gap-2 rounded-full border border-status-warn bg-status-warn-soft px-2.5 py-1">
                   <ShieldAlert className="size-3.5 text-status-warn" />
-                  <span className="text-[11px] font-bold tracking-terminal text-status-warn">
+                  <span className="text-[11px] font-semibold tracking-wide text-status-warn">
                     RECIPIENT SHIELD
                   </span>
                 </div>
-                <h2 className="mt-4 font-terminal text-2xl font-bold tracking-tight">
+                <h2 className="mt-4 text-2xl font-bold tracking-tight">
                   Address poisoning has a counter.
                 </h2>
                 <p className="mt-3 text-sm leading-6 text-muted-foreground">
@@ -191,8 +190,8 @@ export default function Landing() {
                   </li>
                 </ul>
               </motion.div>
-              <motion.div {...fadeUp} transition={{ duration: 0.35, delay: 0.1 }} className="border border-status-warn bg-status-warn-soft p-4 font-terminal">
-                <div className="text-[11px] font-bold tracking-terminal text-status-warn">
+              <motion.div {...fadeUp} transition={{ duration: 0.35, delay: 0.1 }} className="rounded-2xl border border-status-warn bg-status-warn-soft p-4">
+                <div className="text-[11px] font-semibold tracking-wide text-status-warn">
                   ⚠ LOOKALIKE ADDRESS DETECTED
                 </div>
                 <p className="mt-2 text-[11px] leading-5 text-foreground/90">
@@ -212,8 +211,8 @@ export default function Landing() {
                   </div>
                 </div>
                 <div className="mt-3 flex gap-2">
-                  <span className="border border-border bg-card px-2 py-1 text-[10px]">USE PREVIOUS ADDRESS</span>
-                  <span className="border border-border bg-card px-2 py-1 text-[10px]">I VERIFIED THIS ADDRESS</span>
+                  <span className="rounded-full border border-border bg-card px-2.5 py-1 text-[10px] font-medium">USE PREVIOUS ADDRESS</span>
+                  <span className="rounded-full border border-border bg-card px-2.5 py-1 text-[10px] font-medium">I VERIFIED THIS ADDRESS</span>
                 </div>
               </motion.div>
             </div>
@@ -227,11 +226,11 @@ export default function Landing() {
               <motion.div
                 {...fadeUp}
                 transition={{ duration: 0.35 }}
-                className="order-2 border border-status-ok bg-card p-4 lg:order-1"
+                className="order-2 rounded-2xl border border-status-ok bg-card p-4 shadow-sm lg:order-1"
               >
                 <div className="flex items-center gap-2">
                   <FileCheck className="size-4 text-status-ok" />
-                  <span className="font-terminal text-[11px] font-bold tracking-terminal text-status-ok">
+                  <span className="text-[11px] font-semibold tracking-wide text-status-ok">
                     ✓ VERIFIED ON SOLANA
                   </span>
                 </div>
@@ -244,7 +243,7 @@ export default function Landing() {
                     ["Actually received", "100.00 OPENAI"],
                   ].map(([k, v]) => (
                     <div key={k} className="flex items-baseline justify-between gap-3">
-                      <span className="text-[11px] uppercase tracking-terminal text-muted-foreground">{k}</span>
+                      <span className="text-[11px] uppercase tracking-wide text-muted-foreground">{k}</span>
                       <span className="tabular-nums">{v}</span>
                     </div>
                   ))}
@@ -255,7 +254,7 @@ export default function Landing() {
                 </p>
               </motion.div>
               <motion.div {...fadeUp} transition={{ duration: 0.35, delay: 0.08 }} className="order-1 lg:order-2">
-                <h2 className="font-terminal text-2xl font-bold tracking-tight">
+                <h2 className="text-2xl font-bold tracking-tight">
                   “Sent” is not proof.
                 </h2>
                 <p className="mt-3 text-sm leading-6 text-muted-foreground">
@@ -280,7 +279,7 @@ export default function Landing() {
           <div className="mx-auto flex max-w-5xl flex-col gap-2 px-4 py-8 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
               <ScanLine className="size-4 text-primary" />
-              <span className="font-terminal text-xs font-bold tracking-terminal">REYNALENS</span>
+              <span className="text-xs font-semibold tracking-tight">REYNALENS</span>
             </div>
             <p className="text-[11px] leading-5 text-muted-foreground">
               Exact-out PreStocks transfers. Recipient protection before you sign.
