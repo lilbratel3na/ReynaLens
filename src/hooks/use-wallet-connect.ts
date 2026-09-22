@@ -1,95 +1,136 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
+import type { Adapter } from "@solana/wallet-adapter-base";
+import { WalletNotConnectedError } from "@solana/wallet-adapter-base";
 import { toast } from "sonner";
 
 /**
  * Single stable wallet-connection flow.
  *
- * Root causes this fixes (see P0 pass):
- * 1. The old header picker called select(name) and trusted a later effect to
- *    call connect(). That one-shot flag was lost across renders, so taps
- *    appeared dead and retry storms raced the adapter.
- * 2. On Android, returning from a wallet app / background was treated as a
- *    fresh connect: repeated select+connect cycles caused silent failures.
- * 3. No visible connecting state and no surfaced error left the button
- *    looking unresponsive.
+ * P0 root cause this version fixes (verified in WalletProviderBase.js):
+ * the provider's `connect` is a `useCallback` keyed on the SELECTED wallet.
+ * Calling the context `connect` captured BEFORE `select()` invoked the
+ * PREVIOUS closure — whose `wallet` was still the old one. On the first tap
+ * it threw `WalletNotSelectedError` (nothing selected yet); the provider
+ * caught it via onConnectError and reset selection to null. Retry #1 only
+ * managed `select()`, retry #2 finally reached a real adapter — matching the
+ * observed "connect works on the ~3rd tap".
  *
- * Design: the browser wallet-standard adapters expose connect() directly, so
- * we call select(name) then connect() on the freshly selected adapter inside
- * one handler. Taps during connect are ignored (no duplicate attempts).
- * Wallet-standard reconnect is automatic on adapter events; visibilitychange
- * is used ONLY to reconcile state (read publicKey, no select/connect loops).
+ * Fix: resolve the selected ADAPTER from the provider's stable `wallets`
+ * list and drive THAT adapter's connect() directly, with our own
+ * ready-state check and friendly error mapping. No dependence on the
+ * provider closure timing. Provider state syncs via the adapter's
+ * 'connect' event.
+ *
+ * Android deep-link behavior (verified in the Phantom/Solflare adapters):
+ * when the extension is not detected, readyState is `Loadable` and
+ * adapter.connect() NAVIGATES the page to the wallet's universal link
+ * (e.g. phantom.app/ul/browse/…), which opens the current URL in the
+ * wallet's in-app browser. That is the adapter's designed flow, not a bug:
+ * the "refresh" a user sees is this sanctioned handoff. This hook treats it
+ * as such: no retry storm, no extra listeners, no page reload of our own.
+ *
+ * Additional guarantees:
+ * - Tap dedupe: one attempt at a time (provider-level and hook-level).
+ * - Visible connecting state.
+ * - Actionable errors (dismissed / not installed / raw).
+ * - visibilitychange is used ONLY to reconcile state; never select/connect.
  */
 
 export interface WalletUiState {
   /** Adapter name, e.g. "Phantom" — null when none selected. */
   walletName: string | null;
-  /** Detected browser wallet adapter names (installed extensions). */
+  /** Detected browser wallet adapter names. */
   available: string[];
   connected: boolean;
   connecting: boolean;
   address: string | null;
 }
 
+/** True when the adapter can connect right now without a redirect. */
+function isUsable(w: { readyState: string }): boolean {
+  return (
+    w.readyState === "Installed" ||
+    // Wallet-standard loadable wallets (e.g. injected providers detected
+    // lazily). Excluded from the no-redirect check below.
+    w.readyState === "Loadable"
+  );
+}
+
 export function useWalletConnect(): WalletUiState & {
-  /** Open the OS/browser wallet picker for the chosen adapter name. */
+  /** Connect with the named wallet adapter. */
   connectWallet: (name: string) => void;
   /** Explicit disconnect (user-initiated). */
   disconnectWallet: () => void;
 } {
-  const {
-    wallets,
-    wallet,
-    select,
-    connect,
-    disconnect,
-    publicKey,
-    connected,
-    connecting,
-  } = useWallet();
+  const { wallets, wallet, select, disconnect, publicKey, connected, connecting } =
+    useWallet();
 
   const [connectingName, setConnectingName] = useState<string | null>(null);
 
-  // Adapter instances are stable per wallet; derive the available list from
-  // the provider's memoized `wallets` (never rebuild adapters per render).
+  // Adapter instances are stable per wallet; derive the list from the
+  // provider's wrapped `wallets` (never rebuild adapters per render).
   const available = useMemo(
-    () =>
-      wallets
-        .filter(
-          (w) =>
-            w.readyState === "Installed" ||
-            w.readyState === "Loadable" ||
-            // Some standard wallets report unsupported before install-check.
-            w.readyState === "NotDetected",
-        )
-        .map((w) => w.adapter.name),
+    () => wallets.map((w) => w.adapter.name),
     [wallets],
   );
 
   const connectWallet = useCallback(
     (name: string) => {
-      if (connecting) return; // dedupe taps — one attempt at a time
+      if (connecting || connectingName) return; // dedupe taps — one attempt at a time
+
+      // Resolve the CURRENT wallet object from the provider's list. The
+      // `wallet` from context can lag one render behind a fresh select(),
+      // so we do not rely on it for the connect step.
+      const target =
+        wallets.find((w) => w.adapter.name === name) ??
+        wallet; /* fall back to the provider's current selection, if any */
+      if (!target) {
+        toast.error("Wallet unavailable", {
+          description: `${name} is not available in this browser. Install the extension or use a wallet-enabled browser.`,
+        });
+        return;
+      }
+
+      const adapter: Adapter = target.adapter;
+
+      if (adapter.connected) {
+        // Already authorized — nothing to request.
+        return;
+      }
+
+      if (!isUsable(target)) {
+        toast.error(`${name} is not ready`, {
+          description: `Install ${name} (or open this page in a wallet-enabled browser) and reload.`,
+        });
+        return;
+      }
+
       setConnectingName(name);
-      // select() only switches the active adapter in provider state; the
-      // wallet-standard adapter's own connect() is invoked immediately after.
-      select(name as never);
-      // Defer one tick so the provider registers the selected adapter before
-      // we drive connect() on it (same as Solflare/Phantom flows in the
-      // official templates, minus the fragile "flag + effect" pattern).
-      setTimeout(() => {
-        connect().catch((e: unknown) => {
+      adapter
+        .connect()
+        .then(() => {
+          // The adapter emits 'connect'; provider state updates via its own
+          // listener. Select it in provider state so sendTransaction etc.
+          // are wired to this adapter.
+          select(name as never);
+        })
+        .catch((e: unknown) => {
           const msg = e instanceof Error ? e.message : String(e);
           const friendly = /rejected|denied|dismissed|close/i.test(msg)
             ? "Connection request dismissed in the wallet. Tap Connect again to retry."
-            : /no wallet|not installed|not found/i.test(msg)
-              ? `${name} is not available in this browser. Install the extension or use a wallet-enabled browser.`
+            : /not connected|not selected/i.test(msg)
+              ? `${name} could not start a connection session. Tap Connect again.`
               : msg;
-          toast.error("Wallet connection failed", { description: friendly });
+          // Suppress the provider's generic "WalletNotConnectedError" toast
+          // if it ever surfaces through onError — our message is actionable.
+          if (!(e instanceof WalletNotConnectedError)) {
+            toast.error("Wallet connection failed", { description: friendly });
+          }
         })
-          .finally(() => setConnectingName(null));
-      }, 0);
+        .finally(() => setConnectingName(null));
     },
-    [connecting, connect, select],
+    [connecting, connectingName, wallets, wallet, select],
   );
 
   const disconnectWallet = useCallback(() => {
@@ -101,20 +142,19 @@ export function useWalletConnect(): WalletUiState & {
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState !== "visible") return;
-      if (connecting) return;
+      if (connecting || connectingName) return;
       const current = wallet?.adapter;
       if (!current) return;
-      // No-ops when already connected; surfaces stale-state so `connected`
-      // reflects reality without a page reload or adapter churn.
-      if (!connected && current.publicKey) {
-        // Adapter holds a live authorization the provider missed (common
-        // right after returning from the wallet app): re-assert it once.
-        select(current.name as never);
+      // The adapter holds a live authorization the provider may have missed
+      // right after returning from the wallet app: re-assert selection once
+      // so `connected` reflects reality. No connect() here — no reloads.
+      if (!connected && current.publicKey && wallet?.adapter.name) {
+        select(wallet.adapter.name as never);
       }
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [wallet, connected, connecting, select]);
+  }, [wallet, connected, connecting, connectingName, select]);
 
   return {
     walletName: wallet?.adapter.name ?? null,

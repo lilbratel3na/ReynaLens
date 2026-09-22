@@ -524,6 +524,7 @@ function WalletControl({
       <div className="flex shrink-0 items-center gap-2 rounded-full border bg-card py-1 pl-3 pr-1 shadow-sm">
         <span className="size-2 shrink-0 rounded-full bg-emerald-500" />
         <button
+          type="button"
           className="text-xs font-medium tabular-nums"
           onClick={() => {
             void navigator.clipboard.writeText(address);
@@ -567,6 +568,7 @@ function WalletControl({
       {open && (
         <>
           <button
+            type="button"
             aria-label="Close wallet picker"
             className="fixed inset-0 z-30 cursor-default"
             onClick={() => setOpen(false)}
@@ -583,6 +585,7 @@ function WalletControl({
             ) : (
               available.map((name) => (
                 <button
+                  type="button"
                   key={name}
                   className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium transition-colors hover:bg-secondary"
                   onClick={() => {
@@ -659,6 +662,7 @@ function ComposePhase({
             const selected = asset?.mint === a.mint;
             return (
               <button
+                type="button"
                 key={a.mint}
                 onClick={() => void onPick(a)}
                 className={`min-w-[calc(50%-0.25rem)] flex-1 rounded-xl border px-3 py-2.5 text-left transition-colors ${
@@ -716,6 +720,7 @@ function ComposePhase({
             <div className="flex flex-wrap gap-1.5">
               {knownRecipients.slice(0, 4).map((r) => (
                 <button
+                  type="button"
                   key={r.address}
                   onClick={() => onPickKnown(r.address)}
                   className="max-w-full truncate rounded-full border bg-secondary px-2.5 py-1 text-[11px] hover:border-primary/40"
@@ -725,6 +730,7 @@ function ComposePhase({
                 </button>
               ))}
               <button
+                type="button"
                 onClick={onDemoLookalike}
                 className="rounded-full border border-dashed px-2.5 py-1 text-[11px] text-muted-foreground hover:text-foreground"
               >
@@ -936,6 +942,7 @@ function PreviewPhase({
                   ) : (
                     availableWallets.map((name) => (
                       <button
+                        type="button"
                         key={name}
                         className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium transition-colors hover:bg-secondary"
                         onClick={() => {
@@ -1070,6 +1077,7 @@ function ReceiptPhase({
       <Card>
         <SectionLabel>Transaction</SectionLabel>
         <button
+          type="button"
           className="mt-2 flex w-full items-center justify-between gap-2 rounded-xl border bg-secondary px-3 py-2.5 text-left"
           onClick={() => {
             void navigator.clipboard.writeText(verification.signature);
