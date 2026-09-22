@@ -124,7 +124,7 @@ export function calculateExactOut(input: ExactOutInput): ExactOutResult {
 
     // Fixpoint check: fee is charged on the gross, not on the net. Iterate a
     // bounded number of times; for bps < 10000 this converges in <=2 steps.
-    for (let i = 0; BigIntAsInt(fee) + net !== gross && i < 8; i++) {
+    for (let i = 0; fee + net !== gross && i < 8; i++) {
       const next = net + fee;
       if (next === gross) break;
       gross = next;
@@ -161,11 +161,6 @@ export function calculateExactOut(input: ExactOutInput): ExactOutResult {
   };
 }
 
-function BigIntAsInt(v: bigint): number {
-  if (v > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
-  if (v < 0n) return 0;
-  return Number(v);
-}
 
 /** Parse a decimal UI string like "100.05" into integer base units. */
 export function parseUiAmountToBaseUnits(

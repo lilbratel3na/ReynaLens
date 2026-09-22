@@ -12,8 +12,6 @@ import {
   getAccount,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
-  AccountState,
-  unpackMint,
 } from "@solana/spl-token";
 import type { MintInspection } from "./inspectMint";
 
@@ -39,6 +37,8 @@ export interface ShieldVerdict {
   detail: string;
   actions: "block" | "confirm_only" | "ok";
   diffs: ShieldDiff[];
+  /** Canonical base58 of the address the user entered (for diff display). */
+  enteredAddress?: string;
   matchedAgainst?: string;
   matchingAddressLabel?: string | null;
   destinationAccount?: {
@@ -181,6 +181,7 @@ export async function evaluateRecipientShield(
       detail: `This address resembles a previous recipient but is not the same address (${best.d} characters differ). This may indicate an address-poisoning or copy/paste substitution attempt. Verify before continuing.`,
       actions: "confirm_only",
       diffs,
+      enteredAddress: pubkey.toBase58(),
       matchedAgainst: best.rec.address,
       matchingAddressLabel: best.rec.label,
       destinationAccount: dest,
@@ -248,7 +249,7 @@ async function inspectDestination(
     return {
       exists: true,
       owner: acc.owner.toBase58(),
-      frozen: acc.state === AccountState.FROZEN,
+      frozen: acc.isFrozen,
       balance: acc.amount.toString(),
       needsCreation: false,
     };

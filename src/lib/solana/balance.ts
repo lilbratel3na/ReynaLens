@@ -28,7 +28,7 @@ export async function readWalletBalance(
       );
       try {
         const acc = await getAccount(connection, ata, "confirmed", TOKEN_2022_PROGRAM_ID);
-        return { exists: true, amount: acc.amount, frozen: acc.state === 2 };
+        return { exists: true, amount: acc.amount, frozen: acc.isFrozen };
       } catch {
         return { exists: false, amount: 0n, frozen: false };
       }

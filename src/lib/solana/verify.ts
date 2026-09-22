@@ -71,6 +71,48 @@ export async function verifyDelivery(args: {
   };
 }
 
+/**
+ * Confirmation by signature-status polling. Wallet adapters may replace the
+ * recent blockhash at signing time, so confirming with a client-side blockhash
+ * can hang; polling getSignatureStatuses is robust to that.
+ */
+export async function confirmSignature(
+  connection: Connection,
+  signature: string,
+  timeoutMs = 90_000,
+): Promise<{ ok: boolean; slot: number | null; error?: string }> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      const { value } = await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: false,
+      });
+      const st = value[0];
+      if (st) {
+        if (st.err) {
+          return {
+            ok: false,
+            slot: st.slot ?? null,
+            error: `Transaction failed on-chain: ${JSON.stringify(st.err)}`,
+          };
+        }
+        if (
+          st.confirmationStatus === "confirmed" ||
+          st.confirmationStatus === "finalized"
+        ) {
+          return { ok: true, slot: st.slot ?? null };
+        }
+      }
+    } catch {
+      // transient RPC errors — keep polling until timeout
+    }
+    if (Date.now() - start > timeoutMs) {
+      return { ok: false, slot: null, error: "Timed out waiting for confirmation." };
+    }
+    await new Promise((r) => setTimeout(r, 2_000));
+  }
+}
+
 /** Read the destination balance before transfer (0 when account missing). */
 export async function readBalanceOrZero(
   connection: Connection,

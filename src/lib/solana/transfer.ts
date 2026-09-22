@@ -2,11 +2,17 @@ import {
   TOKEN_2022_PROGRAM_ID,
   createAssociatedTokenAccountInstruction,
   createTransferCheckedWithFeeInstruction,
+  getExtraAccountMetaAddress,
+  getExtraAccountMetas,
+  resolveExtraAccountMeta,
 } from "@solana/spl-token";
+import type { AccountMeta } from "@solana/web3.js";
 import {
   ComputeBudgetProgram,
   PublicKey,
   Transaction,
+  TransactionInstruction,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import type { MintInspection } from "./inspectMint";
@@ -17,7 +23,7 @@ export interface BuiltTransfer {
   transaction: Transaction;
   destinationAta: PublicKey;
   /** Extra accounts resolved for a transfer hook, if any. */
-  hookAccounts: PublicKey[];
+  hookAccounts: AccountMeta[];
 }
 
 export interface BuildTransferArgs {
@@ -33,9 +39,9 @@ export interface BuildTransferArgs {
 }
 
 /**
- * Fetch the ExtraAccountMetaList account for a transfer hook, if present.
- * Only static (non-PDA-deriving) metas are supported; anything else is a
- * hard stop per Kill Switch F.
+ * Fetch and resolve the ExtraAccountMetaList for a transfer hook, if present.
+ * Uses the official SPL resolvers so PDA-derived extra accounts are supported;
+ * anything that cannot be resolved is a hard stop per Kill Switch F.
  */
 async function resolveHookAccounts(
   connection: Connection,
@@ -43,61 +49,49 @@ async function resolveHookAccounts(
   source: PublicKey,
   mint: PublicKey,
   destination: PublicKey,
-  owner: PublicKey,
-): Promise<{ accounts: PublicKey[]; errorMessage?: string }> {
-  const [extraAccountMetaList] = PublicKey.findProgramAddressSync(
-    [Buffer.from("extra-account-metas"), mint.toBytes()],
-    hookProgramId,
-  );
+): Promise<{ metas: AccountMeta[]; errorMessage?: string }> {
+  const extraAccountMetaList = getExtraAccountMetaAddress(mint, hookProgramId);
   const info = await connection.getAccountInfo(extraAccountMetaList);
   if (!info) {
     return {
-      accounts: [],
+      metas: [],
       errorMessage: `Transfer hook ${hookProgramId.toBase58()} is active but no ExtraAccountMetaList account was found for this mint. ReynaLens will not construct a hook-unaware transaction.`,
     };
   }
-  // ExtraAccountMetaList layout: 4-byte length prefix, u32 count, then metas.
-  // Meta layouts (discriminator first byte):
-  //   0 = Literal (Pubkey + u8 is_signer + u8 is_writable)  → 35 bytes
-  //   1 = AccountMetaValue (u8 index into [src, mint, dst, owner]) → 2 bytes
-  const data = info.data;
-  if (data.length < 8) {
-    return { accounts: [], errorMessage: "Malformed ExtraAccountMetaList." };
+  let parsed;
+  try {
+    parsed = getExtraAccountMetas(info);
+  } catch {
+    return {
+      metas: [],
+      errorMessage: "Malformed ExtraAccountMetaList — cannot resolve hook accounts. ReynaLens will not construct a hook-unaware transaction.",
+    };
   }
-  const count = data.readUInt32LE(4);
-  const accounts: PublicKey[] = [];
-  let offset = 8;
-  for (let i = 0; i < count; i++) {
-    const discriminator = data[offset];
-    if (discriminator === 0) {
-      if (offset + 35 > data.length) {
-        return {
-          accounts: [],
-          errorMessage: "Truncated ExtraAccountMetaList — cannot resolve hook accounts.",
-        };
-      }
-      const pk = new PublicKey(data.subarray(offset + 1, offset + 33));
-      accounts.push(pk);
-      offset += 35;
-    } else if (discriminator === 1) {
-      const index = data[offset + 1];
-      const mapping = [source, mint, destination, owner];
-      if (index >= mapping.length) {
-        return {
-          accounts: [],
-          errorMessage: "Unresolvable ExtraAccountMeta index.",
-        };
-      }
-      accounts.push(mapping[index]);
-      offset += 2;
-    } else {
+  // The first three accounts the hook sees, in order (src, mint, dst).
+  const previousMetas: AccountMeta[] = [
+    { pubkey: source, isSigner: false, isWritable: true },
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: destination, isSigner: false, isWritable: true },
+  ];
+  const resolved: AccountMeta[] = [];
+  for (const extraMeta of parsed) {
+    try {
+      const meta = await resolveExtraAccountMeta(
+        connection,
+        extraMeta,
+        [...previousMetas, ...resolved],
+        Buffer.alloc(0), // instruction data not referenced by standard seeds
+        hookProgramId,
+      );
+      resolved.push(meta);
+    } catch (e) {
       return {
-        accounts: [],
-        errorMessage: `Unsupported ExtraAccountMeta discriminator ${discriminator}. ReynaLens cannot construct this hook's transaction.`,
+        metas: [],
+        errorMessage: `Could not resolve a transfer-hook account: ${e instanceof Error ? e.message : String(e)}. ReynaLens will not bypass the hook (Kill Switch F).`,
       };
     }
   }
-  return { accounts };
+  return { metas: resolved };
 }
 
 /**
@@ -159,7 +153,7 @@ export async function buildTransferTransaction(
   const maximumFee = BigInt(tier.maximumFee);
   const fee = exactOut.fee > maximumFee ? maximumFee : exactOut.fee;
 
-  const hookAccounts: PublicKey[] = [];
+  const hookAccounts: AccountMeta[] = [];
   if (mintInspection.activeTransferHook && mintInspection.transferHookProgramId) {
     const resolved = await resolveHookAccounts(
       args.connection,
@@ -167,12 +161,11 @@ export async function buildTransferTransaction(
       sourceAta,
       new PublicKey(mintInspection.mint),
       destinationAta,
-      owner,
     );
     if (resolved.errorMessage) {
       throw new Error(resolved.errorMessage);
     }
-    hookAccounts.push(...resolved.accounts);
+    hookAccounts.push(...resolved.metas);
   }
 
   // Official SPL helper: TransferCheckedWithFee (extension instruction 1).
@@ -187,17 +180,15 @@ export async function buildTransferTransaction(
     [],
     TOKEN_2022_PROGRAM_ID,
   );
-  // Hook accounts come after the 4 core accounts (src, mint, dst, authority).
-  transferIx.keys.push(
-    ...hookAccounts.map((pk) => ({
-      pubkey: pk,
-      isSigner: false,
-      isWritable: true,
-    })),
-  );
+  // Hook accounts come after the 4 core accounts (src, mint, dst, authority),
+  // preserving the signer/writable flags from the official resolver.
+  transferIx.keys.push(...hookAccounts);
   ixs.push(transferIx);
 
   const transaction = new Transaction().add(...ixs);
+  // Pin an explicit fee payer so simulate/send never fail with "fee payer
+  // required". The wallet still signs and broadcasts.
+  transaction.feePayer = owner;
   return { transaction, destinationAta, hookAccounts };
 }
 
@@ -208,10 +199,12 @@ export async function simulateTransfer(
   feePayer: PublicKey,
 ): Promise<{ ok: boolean; error?: string; logs?: string[] }> {
   try {
-    // simulateTransaction on a Transaction must be signed by the fee payer
-    // (partial signature) — wallet adapters sign via sendTransaction, so we
-    // simulate with sigVerify=false and let the runtime replace the blockhash.
-    const { value } = await connection.simulateTransaction(transaction, [feePayer], {
+    // Simulate via the VersionedTransaction overload with sigVerify=false and
+    // replaceRecentBlockhash=true. No partial signing is involved: the wallet
+    // adapter signs and broadcasts later. (The legacy (tx, signers) overload
+    // requires actual Signers and suffers from signature-collision caching.)
+    const vtx = new VersionedTransaction(transaction.compileMessage());
+    const { value } = await connection.simulateTransaction(vtx, {
       sigVerify: false,
       replaceRecentBlockhash: true,
     });
