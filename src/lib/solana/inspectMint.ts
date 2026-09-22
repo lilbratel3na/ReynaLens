@@ -11,7 +11,8 @@ import {
   getTokenMetadata,
   getEpochFee,
 } from "@solana/spl-token";
-import type { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
+import type { Connection } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID as TOKEN_2022_STR } from "./prestocks";
 
 export interface TransferFeeTier {
@@ -155,17 +156,24 @@ export async function inspectMint(
     notes.push("No TransferFeeConfig extension on this mint.");
   }
 
-  // Transfer hook: configured-but-noop is inactive.
+  // Transfer hook: the SDK initializes the TransferHook extension with the
+  // System Program (PublicKey.default) as the "no hook" sentinel, and SPL's
+  // own transfer runtime (process_transfer_with_fee) checks
+  // `hook_program_id == system_program` before invoking a hook. The
+  // 538mS… logging program is only the helper real hooks delegate to.
   const hookExt = getTransferHook(mintAcc);
-  const noopProgram = "538mS9CogUtyQF8MhBW7vkHMKCxGe1Rjm2NoZ6L7LSSf";
+  const systemProgramId = PublicKey.default.toBase58();
   const hookProgram = hookExt?.programId ?? null;
-  const activeTransferHook =
-    !!hookProgram && hookProgram.toBase58() !== noopProgram;
+  const hookIsInactive =
+    !hookProgram ||
+    hookProgram.toBase58() === systemProgramId ||
+    hookProgram.toBase58() === "538mS9CogUtyQF8MhBW7vkHMKCxGe1Rjm2NoZ6L7LSSf";
+  const activeTransferHook = !hookIsInactive;
   if (hookProgram) {
     notes.push(
       activeTransferHook
         ? `Transfer hook program ${hookProgram.toBase58()} is ACTIVE — extra accounts will be required.`
-        : "Transfer hook configured but resolves to the no-op program (inactive).",
+        : "Transfer hook configured but resolves to the System Program / no-op (inactive).",
     );
   } else {
     notes.push("No transfer hook configured.");
