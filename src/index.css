@@ -198,6 +198,13 @@
   }
   html {
     -webkit-text-size-adjust: 100%;
+    /* ReynaLens: a transaction app must never reload on touch gestures.
+       Without this rule, Android Chrome's native pull-to-refresh fires on any
+       vertical overscroll (including momentum pans after the finger lifts),
+       and horizontal screen-edge swipes trigger back/forward navigation —
+       both cause a FULL page reload of the preview (full app remount that
+       looks like constant refreshing while scrolling). */
+    overscroll-behavior: none;
   }
   body {
     @apply bg-background text-foreground;
