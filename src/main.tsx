@@ -1,3 +1,4 @@
+import "./lib/buffer-shim";
 import '@vly-ai/integrations';
 import { Toaster } from "@/components/ui/sonner";
 import { RequireAuth } from "@/components/RequireAuth";

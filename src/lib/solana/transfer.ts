@@ -6,11 +6,12 @@ import {
   getExtraAccountMetas,
   resolveExtraAccountMeta,
 } from "@solana/spl-token";
-// The `buffer` polyfill package (same one @solana/web3.js uses). Imported
-// explicitly so `Buffer.alloc` below resolves at runtime in the browser —
-// Vite does not inject a global Buffer.
-import { Buffer } from "buffer";
 import type { AccountMeta } from "@solana/web3.js";
+// The official `buffer` package (the same implementation Node itself uses).
+// `resolveExtraAccountMeta` is typed to take a Buffer; the npm module import
+// is fully browser-safe under Vite (this is NOT the missing global — the
+// entrypoint shim in src/lib/buffer-shim.ts covers SDK global references).
+import { Buffer } from "buffer";
 import {
   ComputeBudgetProgram,
   PublicKey,
