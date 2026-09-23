@@ -1,7 +1,6 @@
 import "./lib/buffer-shim";
 import '@vly-ai/integrations';
 import { Toaster } from "@/components/ui/sonner";
-import { RequireAuth } from "@/components/RequireAuth";
 import { VlyToolbar } from "../vly-toolbar-readonly.tsx";
 import { ConvexAuthProvider } from "@convex-dev/auth/react";
 import { ConvexReactClient } from "convex/react";
@@ -127,14 +126,12 @@ createRoot(document.getElementById("root")!).render(
                   path="/auth"
                   element={<AuthPage redirectAfterAuth="/app" />}
                 />
-                <Route
-                  path="/app"
-                  element={
-                    <RequireAuth>
-                      <AppPage />
-                    </RequireAuth>
-                  }
-                />
+                {/* Public judge/demo entry: /app is the submitted demo path and
+                    must open ReynaLens directly. Wallet connection is requested
+                    only at Sign; per-user Convex data degrades gracefully when
+                    there is no session. Auth infra (/auth + RequireAuth) is
+                    preserved for any session-scoped use. */}
+                <Route path="/app" element={<AppPage />} />
                 <Route path="*" element={<NotFound />} />
               </Routes>
             </Suspense>

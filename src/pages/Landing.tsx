@@ -10,8 +10,6 @@ import {
   Crosshair,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useAuth } from "@/hooks/use-auth";
-import { Navigate } from "react-router";
 
 const fadeUp = {
   initial: { opacity: 0, y: 16 },
@@ -19,7 +17,6 @@ const fadeUp = {
 };
 
 function Nav() {
-  const { isAuthenticated } = useAuth();
   return (
     <header className="border-b border-border bg-background/95">
       <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-4">
@@ -28,8 +25,8 @@ function Nav() {
           <span className="text-sm font-semibold tracking-tight">REYNALENS</span>
         </a>
         <Button asChild size="sm" className="cursor-pointer rounded-full">
-          <a href={isAuthenticated ? "/app" : "/auth"}>
-            {isAuthenticated ? "Open app" : "Connect wallet"}
+          <a href="/app">
+            Open app
             <ArrowRight className="size-3.5" />
           </a>
         </Button>
@@ -39,11 +36,8 @@ function Nav() {
 }
 
 export default function Landing() {
-  const { isAuthenticated, isLoading } = useAuth();
-
   return (
     <div className="min-h-screen bg-background">
-      {isLoading && isAuthenticated ? <Navigate to="/app" replace /> : null}
       <div>
         <Nav />
 
@@ -67,7 +61,7 @@ export default function Landing() {
             </p>
             <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
               <Button asChild size="lg" className="w-full cursor-pointer sm:w-auto">
-                <a href={isAuthenticated ? "/app" : "/auth"}>
+                <a href="/app">
                   Start a transfer <ArrowRight className="size-4" />
                 </a>
               </Button>
@@ -264,7 +258,7 @@ export default function Landing() {
                 </p>
                 <div className="mt-6">
                   <Button asChild className="cursor-pointer">
-                    <a href={isAuthenticated ? "/app" : "/auth"}>
+                    <a href="/app">
                       Try ReynaLens <ArrowRight className="size-4" />
                     </a>
                   </Button>

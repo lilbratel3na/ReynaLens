@@ -58,7 +58,6 @@ import {
   lamportsToSol,
   type WalletBalance,
 } from "@/lib/solana/balance";
-import { DEMO_LOOKALIKE_TARGET, DEMO_KNOWN_RECIPIENTS } from "@/lib/demo";
 import { useWalletConnect } from "@/hooks/use-wallet-connect";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -107,28 +106,19 @@ export default function AppPage() {
     [owner, mintPubkey],
   );
 
-  const knownRecipients: ShieldKnownRecipient[] = useMemo(() => {
-    const real = (recipientRows ?? []).map((r) => ({
-      address: r.address,
-      label: r.label,
-      assetSymbol: r.assetSymbol,
-      lastUsedAt: r.lastUsedAt ?? 0,
-    }));
-    const demo = DEMO_KNOWN_RECIPIENTS.map((r) => ({
-      address: r.address,
-      label: `Demo · ${r.label}`,
-      assetSymbol: r.assetSymbol,
-      lastUsedAt: 0,
-    }));
-    const seen = new Set<string>();
-    const out: ShieldKnownRecipient[] = [];
-    for (const r of [...real, ...demo]) {
-      if (seen.has(r.address)) continue;
-      seen.add(r.address);
-      out.push(r);
-    }
-    return out;
-  }, [recipientRows]);
+  // Recipient history is genuine, per-user data only (no demo seeds). A judge
+  // without a session simply gets an empty history — Shield still runs its real
+  // structural + on-chain destination checks.
+  const knownRecipients: ShieldKnownRecipient[] = useMemo(
+    () =>
+      (recipientRows ?? []).map((r) => ({
+        address: r.address,
+        label: r.label,
+        assetSymbol: r.assetSymbol,
+        lastUsedAt: r.lastUsedAt ?? 0,
+      })),
+    [recipientRows],
+  );
 
   const refreshBalances = useCallback(async () => {
     if (!owner || !mintPubkey) return;
@@ -153,21 +143,26 @@ export default function AppPage() {
       const info = await inspectMint(rpc, new PublicKey(a.mint));
       setMintInspection(info);
     } catch (e) {
-      setInspectError(e instanceof Error ? e.message : String(e));
+      setInspectError(friendlyRpcError(e instanceof Error ? e.message : String(e)));
     } finally {
       setInspecting(false);
     }
   }, []);
 
+  // P0 fix: Preview must NOT require a wallet. The previous `!owner` guard made
+  // the Preview button a silent no-op for disconnected users. selfAddress is
+  // only used for self-transfer / lookalike-of-self similarity checks; an empty
+  // string disables those gracefully when no wallet is connected. The wallet is
+  // requested for the first time at Sign.
   const runShieldThenPreview = useCallback(async () => {
-    if (!owner || !asset || !mintInspection || !mintPubkey) return;
+    if (!asset || !mintInspection || !mintPubkey) return;
     const trimmed = recipientInput.trim();
     setShieldLoading(true);
     setShieldVerdict(null);
     try {
       const verdict = await evaluateRecipientShield({
         address: trimmed,
-        selfAddress: owner.toBase58(),
+        selfAddress: owner?.toBase58() ?? "",
         knownRecipients,
         mint: mintInspection,
         connection: rpc,
@@ -181,7 +176,7 @@ export default function AppPage() {
       setPhase("preview");
     } catch (e) {
       toast.error("Recipient check failed", {
-        description: e instanceof Error ? e.message : String(e),
+        description: friendlyRpcError(e instanceof Error ? e.message : String(e)),
       });
     } finally {
       setShieldLoading(false);
@@ -368,7 +363,7 @@ export default function AppPage() {
       const msg = e instanceof Error ? e.message : String(e);
       const friendly = /rejected|denied|declined/i.test(msg)
         ? "You rejected the transaction in your wallet. Nothing was sent."
-        : msg;
+        : friendlyRpcError(msg);
       setSimError(friendly);
       toast.error("Transfer failed", { description: friendly });
     } finally {
@@ -449,10 +444,7 @@ export default function AppPage() {
                   setRecipientInput(addr);
                   setShieldVerdict(null);
                 }}
-                onDemoLookalike={() => {
-                  setRecipientInput(DEMO_LOOKALIKE_TARGET);
-                  setShieldVerdict(null);
-                }}
+                onRetry={(a) => void pickAsset(a)}
                 amountInput={amountInput}
                 onAmountChange={setAmountInput}
                 amountState={amountState}
@@ -616,7 +608,7 @@ function ComposePhase({
   ownerAddress,
   knownRecipients,
   onPickKnown,
-  onDemoLookalike,
+  onRetry,
   amountInput,
   onAmountChange,
   amountState,
@@ -636,7 +628,7 @@ function ComposePhase({
   ownerAddress: string | null;
   knownRecipients: ShieldKnownRecipient[];
   onPickKnown: (address: string) => void;
-  onDemoLookalike: () => void;
+  onRetry: (a: PreStockAsset) => void;
   amountInput: string;
   onAmountChange: (v: string) => void;
   amountState:
@@ -684,7 +676,22 @@ function ComposePhase({
             <Loader2 className="size-3.5 animate-spin" /> Reading live mint from mainnet…
           </p>
         )}
-        {inspectError && <p className="mt-3 text-xs text-destructive">{inspectError}</p>}
+        {inspectError && (
+          <div className="mt-3 space-y-2">
+            <p className="text-xs text-destructive">{inspectError}</p>
+            {asset && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 rounded-full text-xs"
+                onClick={() => onRetry(asset)}
+              >
+                Retry
+              </Button>
+            )}
+          </div>
+        )}
         {mintInspection && !inspecting && (
           <p className="mt-3 text-xs text-muted-foreground">
             Live fee{" "}
@@ -729,13 +736,6 @@ function ComposePhase({
                   {r.label ?? shortenAddress(r.address, 4)}
                 </button>
               ))}
-              <button
-                type="button"
-                onClick={onDemoLookalike}
-                className="rounded-full border border-dashed px-2.5 py-1 text-[11px] text-muted-foreground hover:text-foreground"
-              >
-                Demo lookalike
-              </button>
             </div>
           </div>
         )}
@@ -865,6 +865,14 @@ function PreviewPhase({
             k="Transfer fee"
             v={exactOut ? `${formatBaseUnits(exactOut.fee, decimals)} ${ticker}` : "—"}
           />
+          <Row
+            k="Live fee rate"
+            v={
+              mintInspection
+                ? `${applicableTier(mintInspection).transferFeeBasisPoints} bps · epoch ${applicableTier(mintInspection).epoch}`
+                : "—"
+            }
+          />
           <Row k="Network fee (est.)" v={`${lamportsToSol(ESTIMATED_SOL_FEE_LAMPORTS)} SOL`} />
         </div>
       </Card>
@@ -872,7 +880,8 @@ function PreviewPhase({
       <Card>
         <SectionLabel>Recipient</SectionLabel>
         <p className="mt-2 break-all font-mono text-xs">{recipient}</p>
-        <div className="mt-3 space-y-1.5">
+        <div className="mt-4 space-y-1.5">
+          <SectionLabel>Recipient checks</SectionLabel>
           <SafetyLine ok label="Valid Solana address" />
           {shieldVerdict?.kind === "known" && (
             <SafetyLine ok label="Previously used by you" />
@@ -1150,6 +1159,22 @@ function SafetyLine({ ok, label }: { ok: boolean; label: string }) {
       <span className={ok ? "text-foreground" : "text-destructive"}>{label}</span>
     </p>
   );
+}
+
+/**
+ * Judges must never see raw RPC/JSON-RPC payloads. Map transport-level chain
+ * read failures to one calm sentence; genuine domain errors (e.g. "not a
+ * Token-2022 mint") pass through verbatim.
+ */
+function friendlyRpcError(msg: string): string {
+  if (
+    /403|access forbidden|jsonrpc|failed to get info|failed to fetch|fetch failed|networkerror|rate.?limit|429|timed? ?out|blockhash/i.test(
+      msg,
+    )
+  ) {
+    return "Can't read this asset from Solana right now.";
+  }
+  return msg;
 }
 
 function recipientValid(v: string): boolean {

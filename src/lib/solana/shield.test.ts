@@ -8,18 +8,23 @@ import {
   type ShieldKnownRecipient,
 } from "./shield";
 import type { MintInspection } from "./inspectMint";
-import {
-  DEMO_KNOWN_RECIPIENTS,
-  DEMO_LOOKALIKE_TARGET,
-} from "../demo";
 
-// Note on constants: the demo lookalike differs from "Ops treasury" by exactly
-// 2 substituted characters, which pins LOOKALIKE_MIN_EDITS <= 2; both demo
-// addresses are ordinary unrelated pubkeys (Levenshtein distance well above
-// the band), so the scenarios below cannot cross-fire.
-
-const OPS_TREASURY = DEMO_KNOWN_RECIPIENTS[0];
-const RAVI = DEMO_KNOWN_RECIPIENTS[1];
+// Local unit-test fixtures only. The shipped UI no longer seeds any demo
+// recipient history — the app uses genuine per-user history — but these two
+// unrelated pubkeys plus a 2-character near-miss remain ideal for exercising
+// the known/lookalike classification logic deterministically.
+const OPS_TREASURY = {
+  address: "6ASf5EcmmEHTgDJ4X4ZT5vT6iHVJBXPg5AN5YoTCpGWt",
+  label: "Ops treasury",
+  assetSymbol: "OPENAI",
+};
+const RAVI = {
+  address: "8tMU4uPgbGA12ENcHdjVcPWfSxyhuxdyGTrxyMXcFahH",
+  label: "Ravi (OTC)",
+  assetSymbol: "OPENAI",
+};
+/** 2 substituted characters from OPS_TREASURY. */
+const LOOKALIKE_TARGET = "6ASf51cmmEHTgDJ4X4ZT5vTSiHVJBXPg5AN5YoTCpGWt";
 
 const SELF = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"; // valid mainnet address shape
 
@@ -77,8 +82,8 @@ function makeContext(overrides: {
 }
 
 describe("evaluateRecipientShield", () => {
-  it("classifies the demo lookalike as lookalike and flags the differing chars", async () => {
-    const v = await evaluateRecipientShield(makeContext({ address: DEMO_LOOKALIKE_TARGET }));
+  it("classifies a near-miss recipient as lookalike and flags the differing chars", async () => {
+    const v = await evaluateRecipientShield(makeContext({ address: LOOKALIKE_TARGET }));
     expect(v.kind).toBe("lookalike");
     expect(v.matchedAgainst).toBe(OPS_TREASURY.address);
     expect(v.matchingAddressLabel).toBe(OPS_TREASURY.label);
