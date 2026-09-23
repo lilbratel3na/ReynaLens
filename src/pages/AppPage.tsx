@@ -54,15 +54,38 @@ import {
 } from "@/lib/solana/verify";
 import {
   readWalletBalance,
+  estimateTransactionFeeLamports,
   ESTIMATED_SOL_FEE_LAMPORTS,
   lamportsToSol,
   type WalletBalance,
 } from "@/lib/solana/balance";
+import {
+  evaluatePreflight,
+  estimateAtaRentLamports,
+} from "@/lib/solana/preflight";
+import {
+  saveTransferIntent,
+  loadTransferIntent,
+  clearTransferIntent,
+} from "@/lib/transferIntent";
 import { useWalletConnect } from "@/hooks/use-wallet-connect";
 import { useWallet } from "@solana/wallet-adapter-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 type Phase = "compose" | "preview" | "receipt";
+
+/** Deterministic Sign & Send states (P0 Part G). */
+type SignPhase =
+  | "idle" // connected, no attempt yet → Sign & Send
+  | "preflight" // reading live balances / requirements
+  | "simulating" // real transaction simulation
+  | "insufficient_token" // stop before signature, friendly balance error
+  | "insufficient_sol" // stop before signature, friendly SOL error
+  | "failed" // simulation/other failure, no signature prompt
+  | "ready" // simulated OK, waiting for explicit user consent
+  | "signing" // wallet signature prompt open
+  | "submitted" // on-chain confirmation in progress
+  | "confirmed"; // verified receipt phase
 
 export default function AppPage() {
   const {
@@ -95,6 +118,9 @@ export default function AppPage() {
   const [busyLine, setBusyLine] = useState<string | null>(null);
   const [verification, setVerification] = useState<DeliveryVerification | null>(null);
   const [finalExactOut, setFinalExactOut] = useState<ExactOutResult | null>(null);
+  const [signPhase, setSignPhase] = useState<SignPhase>("idle");
+  /** Explicit user consent between a successful simulation and the signature. */
+  const confirmedReadyRef = useRef(false);
 
   const owner = walletAddress ? new PublicKey(walletAddress) : null;
   const mintPubkey = useMemo(() => (asset ? new PublicKey(asset.mint) : null), [asset]);
@@ -148,6 +174,74 @@ export default function AppPage() {
       setInspecting(false);
     }
   }, []);
+
+  // ── Restore in-progress transfer intent after lifecycle remounts ────────
+  // Mobile deep links and ordinary reloads unmount this component. Session
+  // persistence keeps the user's INTENT (mint, recipient, amount, phase);
+  // every chain-derived value is recomputed live below — the stored intent is
+  // never treated as authoritative chain state. Never auto-signs.
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+    const intent = loadTransferIntent();
+    if (!intent) return;
+    const mintAsset = PRESTOCK_ASSETS.find((a) => a.mint === intent.mint);
+    if (!mintAsset) return;
+    setAsset(mintAsset);
+    setRecipientInput(intent.recipient);
+    setAmountInput(intent.amount);
+    setPhase(intent.phase === "preview" ? "preview" : "compose");
+    if (intent.phase !== "preview") return;
+    void (async () => {
+      setInspecting(true);
+      try {
+        const info = await inspectMint(rpc, new PublicKey(mintAsset.mint));
+        setMintInspection(info);
+        // Re-run the recipient checks against live state (history is rebuilt
+        // by the reactive query; restore uses what is currently available).
+        const verdict = await evaluateRecipientShield({
+          address: intent.recipient,
+          selfAddress: walletAddress ?? "",
+          knownRecipients: (recipientRows ?? []).map((r) => ({
+            address: r.address,
+            label: r.label,
+            assetSymbol: r.assetSymbol,
+            lastUsedAt: r.lastUsedAt ?? 0,
+          })),
+          mint: info,
+          connection: rpc,
+          mintPubkey: new PublicKey(mintAsset.mint),
+        });
+        if (verdict.actions === "block") {
+          toast.error(verdict.title, { description: verdict.detail });
+          setPhase("compose");
+          return;
+        }
+        setShieldVerdict(verdict);
+      } catch {
+        setInspectError(friendlyRpcError("Could not restore live mint state."));
+        setPhase("compose");
+      } finally {
+        setInspecting(false);
+      }
+    })();
+    // Restore runs exactly once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist the user's intent on every change. Phase "receipt" is deliberately
+  // stored as "preview": after a completed transfer a restored session returns
+  // to Preview with the live values recomputed, never to a fabricated receipt.
+  useEffect(() => {
+    if (!asset || !recipientInput.trim() || !amountInput.trim()) return;
+    saveTransferIntent({
+      mint: asset.mint,
+      recipient: recipientInput.trim(),
+      amount: amountInput,
+      phase: phase === "receipt" ? "preview" : phase,
+    });
+  }, [asset, recipientInput, amountInput, phase]);
 
   // P0 fix: Preview must NOT require a wallet. The previous `!owner` guard made
   // the Preview button a silent no-op for disconnected users. selfAddress is
@@ -242,12 +336,42 @@ export default function AppPage() {
   const exactOut = amountState?.state === "ok" ? amountState.out : null;
 
   const executeTransfer = useCallback(async () => {
-    if (!owner || !asset || !mintInspection || !mintPubkey || !exactOut || !shieldVerdict) {
+    if (!owner || !asset || !mintInspection || !mintPubkey || !exactOut) {
       return;
     }
     setBusy(true);
     setSimError(null);
+    setSignPhase("preflight");
     try {
+      // ── Pre-sign preflight (P0 Part C) — before ANY wallet prompt ──
+      setBusyLine("Checking balances for this transfer…");
+      const [freshBalances, txFeeLamports] = await Promise.all([
+        readWalletBalance(rpc, owner, mintPubkey),
+        estimateTransactionFeeLamports(rpc),
+      ]);
+      setBalances(freshBalances);
+      const needsAtaNow =
+        !shieldVerdict || (shieldVerdict.destinationAccount?.needsCreation ?? true);
+      const ataRentLamports = needsAtaNow
+        ? ((await estimateAtaRentLamports(rpc, mintInspection, mintPubkey)) ?? 0)
+        : 0;
+      const pre = evaluatePreflight({
+        tokenBalance: freshBalances.tokenBaseUnits ?? 0n,
+        gross: exactOut.gross,
+        decimals: mintInspection.decimals,
+        ticker: asset.ticker,
+        solLamports: freshBalances.solLamports,
+        txFeeLamports,
+        ataRentLamports,
+      });
+      if (pre.kind !== "ok") {
+        // Stop here: the wallet is never asked to sign without sufficient
+        // PreStock balance and SOL for fees + any required account rent.
+        setSignPhase(pre.kind);
+        setSimError(pre.message);
+        return;
+      }
+
       setBusyLine("Re-checking live transfer-fee configuration…");
       const fresh = await inspectMint(rpc, mintPubkey);
       let effective = exactOut;
@@ -275,6 +399,7 @@ export default function AppPage() {
         }
       }
 
+      setSignPhase("simulating");
       setBusyLine("Building and simulating transaction…");
       const recipientPk = new PublicKey(recipientInput.trim());
       const destinationAta = deriveRecipientAta(recipientPk, mintPubkey);
@@ -293,14 +418,23 @@ export default function AppPage() {
       const sim = await simulateTransfer(rpc, built.transaction, owner);
       if (!sim.ok) {
         const reason = sim.error ?? "Preflight simulation failed.";
+        setSignPhase("failed");
         setSimError(reason);
         toast.error("Transfer blocked", { description: reason });
+        return;
+      }
+
+      // Simulation succeeded. Signature is a separate explicit step (P0 Part
+      // E): stop at the wallet-signing boundary until the user asks for it.
+      if (!confirmedReadyRef.current) {
+        setSignPhase("ready");
         return;
       }
 
       setBusyLine("Reading destination balance before transfer…");
       const pre = needsAtaCreation ? 0n : await readBalanceOrZero(rpc, destinationAta);
 
+      setSignPhase("signing");
       setBusyLine("Waiting for wallet signature…");
       const latest = await rpc.getLatestBlockhash("confirmed");
       const tx = built.transaction;
@@ -308,6 +442,7 @@ export default function AppPage() {
       tx.feePayer = owner;
       const sig = await sendTransaction(tx, rpc);
 
+      setSignPhase("submitted");
       setBusyLine("Confirming on Solana…");
       const confirmation = await confirmSignature(rpc, sig);
       if (!confirmation.ok) {
@@ -316,6 +451,7 @@ export default function AppPage() {
           "The transaction did not confirm in time. Check the explorer before retrying — do not double-send.";
         toast.error("Confirmation not verified", { description: reason });
         setSimError(reason);
+        setSignPhase("failed");
         return;
       }
 
@@ -327,6 +463,7 @@ export default function AppPage() {
         requestedNet: effective.net,
         signature: sig,
       });
+      setSignPhase("confirmed");
       setVerification(proof);
       setFinalExactOut(effective);
 
@@ -365,6 +502,7 @@ export default function AppPage() {
         ? "You rejected the transaction in your wallet. Nothing was sent."
         : friendlyRpcError(msg);
       setSimError(friendly);
+      setSignPhase("failed");
       toast.error("Transfer failed", { description: friendly });
     } finally {
       setBusy(false);
@@ -374,6 +512,15 @@ export default function AppPage() {
     owner, asset, mintInspection, mintPubkey, exactOut, shieldVerdict,
     sourceAta, recipientInput, sendTransaction, recordRecipient, saveReceiptMut,
   ]);
+
+  // The explicit consent step between a successful simulation and the wallet
+  // prompt (P0 Part E). Re-running executeTransfer re-verifies balances and
+  // re-simulates — nothing is signed automatically.
+  const requestSignature = useCallback(() => {
+    confirmedReadyRef.current = true;
+    setSignPhase("preflight");
+    void executeTransfer();
+  }, [executeTransfer]);
 
   const canPreview =
     !!asset &&
@@ -394,7 +541,9 @@ export default function AppPage() {
     setVerification(null);
     setFinalExactOut(null);
     setSimError(null);
+    setSignPhase("idle");
     setPhase("compose");
+    clearTransferIntent();
   };
 
   return (
@@ -467,12 +616,17 @@ export default function AppPage() {
                 busy={busy}
                 busyLine={busyLine}
                 simError={simError}
+                signPhase={signPhase}
                 connected={connected}
                 connecting={connecting}
                 availableWallets={availableWallets}
                 onConnect={connectWallet}
                 onSign={executeTransfer}
-                onBack={() => setPhase("compose")}
+                onRequestSignature={requestSignature}
+                onBack={() => {
+                  setSignPhase("idle");
+                  setPhase("compose");
+                }}
               />
             )}
 
@@ -803,6 +957,7 @@ function PreviewPhase({
   busy,
   busyLine,
   simError,
+  signPhase,
   connected,
   connecting,
   availableWallets,
@@ -819,11 +974,13 @@ function PreviewPhase({
   busy: boolean;
   busyLine: string | null;
   simError: string | null;
+  signPhase: SignPhase;
   connected: boolean;
   connecting: boolean;
   availableWallets: string[];
   onConnect: (name: string) => void;
   onSign: () => void;
+  onRequestSignature: () => void;
   onBack: () => void;
 }) {
   const decimals = mintInspection?.decimals ?? 9;
@@ -973,6 +1130,37 @@ function PreviewPhase({
             <Loader2 className="size-4 shrink-0 animate-spin text-primary" />
             {busyLine ?? "Working…"}
           </div>
+        ) : signPhase === "ready" ? (
+          <>
+            <p className="text-xs leading-5 text-muted-foreground">
+              From {owner ? shortenAddress(owner.toBase58(), 4) : "your wallet"} ·
+              transaction built and simulated against live Solana state. Ready
+              for your signature — nothing is sent until you approve.
+            </p>
+            <Button
+              className="mt-3 h-12 w-full rounded-2xl text-base font-semibold"
+              onClick={onRequestSignature}
+              disabled={!exactOut}
+            >
+              Request wallet signature
+            </Button>
+          </>
+        ) : signPhase === "insufficient_token" ||
+          signPhase === "insufficient_sol" ||
+          signPhase === "failed" ? (
+          <>
+            <p className="text-xs leading-5 text-muted-foreground">
+              From {owner ? shortenAddress(owner.toBase58(), 4) : "your wallet"} ·
+              the wallet was not asked to sign.
+            </p>
+            <Button
+              variant="outline"
+              className="mt-3 h-11 w-full rounded-2xl"
+              onClick={onRequestSignature}
+            >
+              Try again
+            </Button>
+          </>
         ) : (
           <>
             <p className="text-xs leading-5 text-muted-foreground">
@@ -988,11 +1176,17 @@ function PreviewPhase({
             </Button>
           </>
         )}
-        {simError && (
-          <p className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs leading-5 text-destructive">
-            {simError}
-          </p>
-        )}
+        {simError &&
+          ![
+            "ready",
+            "insufficient_token",
+            "insufficient_sol",
+            "failed",
+          ].includes(signPhase) && (
+            <p className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs leading-5 text-destructive">
+              {simError}
+            </p>
+          )}
       </Card>
 
       <Button variant="ghost" className="w-full" onClick={onBack} disabled={busy}>
