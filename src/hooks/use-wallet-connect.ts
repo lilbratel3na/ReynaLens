@@ -19,8 +19,10 @@ import { toast } from "sonner";
  * Fix: resolve the selected ADAPTER from the provider's stable `wallets`
  * list and drive THAT adapter's connect() directly, with our own
  * ready-state check and friendly error mapping. No dependence on the
- * provider closure timing. Provider state syncs via the adapter's
- * 'connect' event.
+ * provider closure timing. select() runs BEFORE adapter.connect() so the
+ * provider's 'connect' listener is attached when the adapter authorizes;
+ * provider state (publicKey/connected) then updates and the UI follows.
+ * Provider state syncs via the adapter's 'connect' event.
  *
  * Android deep-link behavior (verified in the Phantom/Solflare adapters):
  * when the extension is not detected, readyState is `Loadable` and
@@ -94,15 +96,35 @@ export function useWalletConnect(): WalletUiState & {
 
       const adapter: Adapter = target.adapter;
 
-      if (adapter.connected) {
-        // Already authorized — nothing to request.
-        return;
-      }
-
-      if (!isUsable(target)) {
+      if (!isUsable(target) && !adapter.connected) {
         toast.error(`${name} is not ready`, {
           description: `Install ${name} (or open this page in a wallet-enabled browser) and reload.`,
         });
+        return;
+      }
+
+      // P0 reconciliation fix — select BEFORE connecting.
+      //
+      // Verified in WalletProviderBase.js (0.15.40): publicKey/connected are
+      // only ever updated inside the provider's 'connect' EVENT listener,
+      // which is attached in an effect keyed on the `adapter` prop — i.e.
+      // only after select(). There is no re-sync of an adapter's existing
+      // authorization on attach (state initializers run once at mount, when
+      // the prop is still null). The previous connect-then-select order
+      // therefore lost the 'connect' event every time: the adapter authorized
+      // while no listener existed, and the late select() could not
+      // retroactively sync state — the UI stayed "not connected" even though
+      // the wallet itself was connected.
+      //
+      // select() is a synchronous local state write (no wallet prompt, no
+      // error), so ordering it first cannot regress the first-tap fix below:
+      // we still never call the provider's closure-bound connect(); we drive
+      // the stable adapter instance directly.
+      select(name as never);
+
+      if (adapter.connected) {
+        // Already authorized — selection alone wires provider state (and
+        // sendTransaction) to this adapter. Nothing to request.
         return;
       }
 
@@ -110,9 +132,10 @@ export function useWalletConnect(): WalletUiState & {
       adapter
         .connect()
         .then(() => {
-          // The adapter emits 'connect'; provider state updates via its own
-          // listener. Select it in provider state so sendTransaction etc.
-          // are wired to this adapter.
+          // The adapter emitted 'connect' and the provider listener (now
+          // attached) synced publicKey/connected. Re-select is a no-op when
+          // the name already matches (changeWallet early-returns) and only
+          // repairs selection if an intervening disconnect cleared it.
           select(name as never);
         })
         .catch((e: unknown) => {
@@ -137,24 +160,30 @@ export function useWalletConnect(): WalletUiState & {
     disconnect().catch(() => undefined);
   }, [disconnect]);
 
-  // Reconcile on visibility ONLY: when returning from Phantom/background,
-  // read the adapter's current authority; do NOT re-run connect/select loops.
+  // Reconcile on visibility ONLY: when returning from the wallet app after a
+  // deep-link handoff, if the adapter already holds an authorization but the
+  // provider never got the 'connect' event (cold page context), run ONE silent
+  // adapter.connect() — for an already-authorized adapter this resolves
+  // instantly without any prompt and emits 'connect', which syncs provider
+  // state. A bare select() is useless here: changeWallet() early-returns when
+  // the name is unchanged, so it cannot repair stale state.
+  //
+  // The Mobile Wallet Adapter is excluded: connect() on it re-opens the wallet
+  // app (deep link), which would loop the user away. No timers, no reloads,
+  // no connect storms — single guarded attempt per visibility transition.
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState !== "visible") return;
       if (connecting || connectingName) return;
+      if (connected) return;
       const current = wallet?.adapter;
-      if (!current) return;
-      // The adapter holds a live authorization the provider may have missed
-      // right after returning from the wallet app: re-assert selection once
-      // so `connected` reflects reality. No connect() here — no reloads.
-      if (!connected && current.publicKey && wallet?.adapter.name) {
-        select(wallet.adapter.name as never);
-      }
+      if (!current || current.connected || !current.publicKey) return;
+      if (current.name === "Mobile Wallet Adapter") return;
+      current.connect().catch(() => undefined);
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [wallet, connected, connecting, connectingName, select]);
+  }, [wallet, connected, connecting, connectingName]);
 
   return {
     walletName: wallet?.adapter.name ?? null,

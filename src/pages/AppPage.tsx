@@ -984,7 +984,7 @@ function PreviewPhase({
               onClick={onSign}
               disabled={!exactOut}
             >
-              Sign Transaction
+              Sign &amp; Send
             </Button>
           </>
         )}
