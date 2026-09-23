@@ -4,7 +4,11 @@
  * real chain data (never a hardcoded rent constant).
  */
 
-import { TOKEN_2022_PROGRAM_ID, getAccountDataSize, ExtensionType } from "@solana/spl-token";
+import {
+  unpackMint,
+  getAccountLenForMint,
+} from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import { formatBaseUnits } from "./exactOut";
 import type { MintInspection } from "./inspectMint";
@@ -39,9 +43,12 @@ export function evaluatePreflight(input: PreflightInput): PreflightResult {
     input;
 
   if (tokenBalance < gross) {
+    // Trim trailing zeros for readability without any precision loss — the
+    // raw base-unit numbers remain the sole source of truth.
+    const fmt = (v: bigint) => formatBaseUnits(v, decimals).replace(/\.?0+$/, "");
     return {
       kind: "insufficient_token",
-      message: `Insufficient ${ticker} balance. You need ${formatBaseUnits(gross, decimals)} ${ticker} to send this amount (you hold ${formatBaseUnits(tokenBalance, decimals)} ${ticker}).`,
+      message: `Insufficient ${ticker} balance. You need ${fmt(gross)} ${ticker} to send this amount (you hold ${fmt(tokenBalance)} ${ticker}).`,
     };
   }
 
@@ -67,10 +74,11 @@ export function evaluatePreflight(input: PreflightInput): PreflightResult {
  *      THIS mint (accounts inherit extension space from the mint), then
  *   2. ask the RPC for getMinimumBalanceForRentExemption(that space).
  *
- * Falls back to getAccountDataSize for the account extensions implied by the
- * mint (TransferHook → accounts carry TransferHookAccount). Returns null only
- * if the chain cannot be read at all — the caller then skips the rent portion
- * of the SOL check rather than inventing a number.
+ * Fallback: the official account-length helper over the mint's LIVE extension
+ * set (`getAccountLenForMint` on the unpacked mint — accounts carry the
+ * account-side of the mint's extensions, e.g. TransferHook → TransferHookAccount).
+ * Returns null only if the chain cannot be read at all — the caller then skips
+ * the rent portion of the SOL check rather than inventing a number.
  */
 export async function estimateAtaRentLamports(
   connection: Connection,
@@ -81,7 +89,7 @@ export async function estimateAtaRentLamports(
   // the space a freshly created ATA for this mint will occupy).
   try {
     const largest = await connection.getTokenLargestAccounts(mint);
-    const sample = largest.value.find((a) => a.amount > 0n) ?? largest.value[0];
+    const sample = largest.value.find((a) => a.amount !== "0") ?? largest.value[0];
     if (sample) {
       const info = await connection.getAccountInfo(sample.address);
       if (info && info.data.length > 0) {
@@ -92,13 +100,12 @@ export async function estimateAtaRentLamports(
     /* fall through to the layout-based fallback */
   }
 
-  // 2. Fallback: deterministic size from the mint's extension set.
+  // 2. Fallback: the official helper over the mint's LIVE extension set.
   try {
-    const extensions =
-      mintInspection.extensions.includes("TransferHook")
-        ? [ExtensionType.TransferHookAccount]
-        : [];
-    const size = getAccountDataSize(TOKEN_2022_PROGRAM_ID, extensions);
+    const accountInfo = await connection.getAccountInfo(mint);
+    if (!accountInfo) return null;
+    const mintAcc = unpackMint(mint, accountInfo, accountInfo.owner);
+    const size = getAccountLenForMint(mintAcc);
     return await connection.getMinimumBalanceForRentExemption(size);
   } catch {
     return null;

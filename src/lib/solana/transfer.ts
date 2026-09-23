@@ -31,6 +31,14 @@ export interface BuiltTransfer {
   hookAccounts: AccountMeta[];
 }
 
+/**
+ * Compute budget pinned for every ReynaLens transfer. Exported so the
+ * preflight fee estimator (balance.ts) charges the EXACT budget the real
+ * transaction carries — a single source of truth, never a parallel guess.
+ */
+export const TRANSFER_COMPUTE_UNIT_LIMIT = 300_000;
+export const TRANSFER_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS = 20_000;
+
 export interface BuildTransferArgs {
   connection: Connection;
   owner: PublicKey;
@@ -133,8 +141,10 @@ export async function buildTransferTransaction(
 
   // Generous compute budget; ATA creation + fee accounting can exceed default.
   ixs.push(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 20_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: TRANSFER_COMPUTE_UNIT_LIMIT }),
+    ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: TRANSFER_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+    }),
   );
 
   if (needsAtaCreation) {

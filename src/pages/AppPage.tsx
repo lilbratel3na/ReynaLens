@@ -55,7 +55,6 @@ import {
 import {
   readWalletBalance,
   estimateTransactionFeeLamports,
-  ESTIMATED_SOL_FEE_LAMPORTS,
   lamportsToSol,
   type WalletBalance,
 } from "@/lib/solana/balance";
@@ -113,6 +112,8 @@ export default function AppPage() {
   const [shieldLoading, setShieldLoading] = useState(false);
   const [amountInput, setAmountInput] = useState("");
   const [balances, setBalances] = useState<WalletBalance | null>(null);
+  /** LIVE network-fee estimate for the Preview display row (null = still reading). */
+  const [txFeeEstimate, setTxFeeEstimate] = useState<number | null>(null);
   const [simError, setSimError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyLine, setBusyLine] = useState<string | null>(null);
@@ -159,6 +160,19 @@ export default function AppPage() {
   useEffect(() => {
     if (owner && mintPubkey) void refreshBalances();
   }, [owner, mintPubkey, refreshBalances]);
+
+  // Live network-fee estimate for Preview — derived from real chain state via
+  // getFeeForMessage (never a hardcoded constant). Re-read per selected asset.
+  useEffect(() => {
+    if (!mintPubkey) return;
+    let cancelled = false;
+    void estimateTransactionFeeLamports(rpc).then((fee) => {
+      if (!cancelled) setTxFeeEstimate(fee);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [mintPubkey]);
 
   const pickAsset = useCallback(async (a: PreStockAsset) => {
     setAsset(a);
@@ -337,38 +351,85 @@ export default function AppPage() {
 
   const executeTransfer = useCallback(async () => {
     if (!owner || !asset || !mintInspection || !mintPubkey || !exactOut) {
+      // Never a silent no-op: the user must see why nothing happened.
+      setSimError(
+        !owner
+          ? "Connect a wallet before signing."
+          : "Transfer details are incomplete — go back and re-check the amount.",
+      );
+      setSignPhase("failed");
       return;
     }
+    // Consent is single-use per run: if anything fails after the user asked
+    // for a signature, the next attempt must stop at the simulation boundary
+    // again — never carry authorization forward into a fresh run.
+    const consented = confirmedReadyRef.current;
+    confirmedReadyRef.current = false;
     setBusy(true);
     setSimError(null);
     setSignPhase("preflight");
     try {
+      // ── Shield is REQUIRED before building/signing (no silent skip), and is
+      // always re-run here against CURRENT state: the verdict shown in Preview
+      // may predate a restored session, changed recipient history, or a stale
+      // destination-account read. An evaluation failure stops loudly.
+      setBusyLine("Verifying recipient account state…");
+      let verdict: ShieldVerdict;
+      try {
+        verdict = await evaluateRecipientShield({
+          address: recipientInput.trim(),
+          selfAddress: owner.toBase58(),
+          knownRecipients,
+          mint: mintInspection,
+          connection: rpc,
+          mintPubkey,
+        });
+        setShieldVerdict(verdict);
+      } catch {
+        setSignPhase("failed");
+        setSimError(
+          "Could not verify the recipient before signing. Check your connection and try again — nothing was signed.",
+        );
+        return;
+      }
+      if (verdict.actions === "block") {
+        setSignPhase("failed");
+        setSimError(`${verdict.title} — ${verdict.detail}`);
+        return;
+      }
+
       // ── Pre-sign preflight (P0 Part C) — before ANY wallet prompt ──
       setBusyLine("Checking balances for this transfer…");
-      const [freshBalances, txFeeLamports] = await Promise.all([
+      const [freshBalances, txFeeEstimate] = await Promise.all([
         readWalletBalance(rpc, owner, mintPubkey),
         estimateTransactionFeeLamports(rpc),
       ]);
       setBalances(freshBalances);
-      const needsAtaNow =
-        !shieldVerdict || (shieldVerdict.destinationAccount?.needsCreation ?? true);
+      if (txFeeEstimate === null) {
+        setSignPhase("failed");
+        setSimError(
+          "Could not read current network fees from Solana. Check your connection and try again — nothing was signed.",
+        );
+        return;
+      }
+      const needsAtaNow = verdict.destinationAccount?.needsCreation ?? true;
       const ataRentLamports = needsAtaNow
         ? ((await estimateAtaRentLamports(rpc, mintInspection, mintPubkey)) ?? 0)
         : 0;
-      const pre = evaluatePreflight({
+      const preVerdict = evaluatePreflight({
         tokenBalance: freshBalances.tokenBaseUnits ?? 0n,
         gross: exactOut.gross,
         decimals: mintInspection.decimals,
         ticker: asset.ticker,
         solLamports: freshBalances.solLamports,
-        txFeeLamports,
+        txFeeLamports: txFeeEstimate,
         ataRentLamports,
       });
-      if (pre.kind !== "ok") {
+      if (preVerdict.kind !== "ok") {
         // Stop here: the wallet is never asked to sign without sufficient
         // PreStock balance and SOL for fees + any required account rent.
-        setSignPhase(pre.kind);
-        setSimError(pre.message);
+        setSignPhase(preVerdict.kind);
+        setSimError(preVerdict.message);
         return;
       }
 
@@ -403,7 +464,7 @@ export default function AppPage() {
       setBusyLine("Building and simulating transaction…");
       const recipientPk = new PublicKey(recipientInput.trim());
       const destinationAta = deriveRecipientAta(recipientPk, mintPubkey);
-      const needsAtaCreation = shieldVerdict.destinationAccount?.needsCreation ?? true;
+      const needsAtaCreation = verdict.destinationAccount?.needsCreation ?? true;
       const built: BuiltTransfer = await buildTransferTransaction({
         connection: rpc,
         owner,
@@ -426,13 +487,15 @@ export default function AppPage() {
 
       // Simulation succeeded. Signature is a separate explicit step (P0 Part
       // E): stop at the wallet-signing boundary until the user asks for it.
-      if (!confirmedReadyRef.current) {
+      if (!consented) {
         setSignPhase("ready");
         return;
       }
 
       setBusyLine("Reading destination balance before transfer…");
-      const pre = needsAtaCreation ? 0n : await readBalanceOrZero(rpc, destinationAta);
+      const preDestinationBalance = needsAtaCreation
+        ? 0n
+        : await readBalanceOrZero(rpc, destinationAta);
 
       setSignPhase("signing");
       setBusyLine("Waiting for wallet signature…");
@@ -459,7 +522,7 @@ export default function AppPage() {
       const proof = await verifyDelivery({
         connection: rpc,
         destinationAta,
-        preBalanceBaseUnits: pre,
+        preBalanceBaseUnits: preDestinationBalance,
         requestedNet: effective.net,
         signature: sig,
       });
@@ -510,7 +573,8 @@ export default function AppPage() {
     }
   }, [
     owner, asset, mintInspection, mintPubkey, exactOut, shieldVerdict,
-    sourceAta, recipientInput, sendTransaction, recordRecipient, saveReceiptMut,
+    knownRecipients, sourceAta, recipientInput, sendTransaction, recordRecipient,
+    saveReceiptMut,
   ]);
 
   // The explicit consent step between a successful simulation and the wallet
@@ -617,6 +681,7 @@ export default function AppPage() {
                 busyLine={busyLine}
                 simError={simError}
                 signPhase={signPhase}
+                txFeeEstimate={txFeeEstimate}
                 connected={connected}
                 connecting={connecting}
                 availableWallets={availableWallets}
@@ -958,11 +1023,13 @@ function PreviewPhase({
   busyLine,
   simError,
   signPhase,
+  txFeeEstimate,
   connected,
   connecting,
   availableWallets,
   onConnect,
   onSign,
+  onRequestSignature,
   onBack,
 }: {
   asset: PreStockAsset | null;
@@ -975,6 +1042,8 @@ function PreviewPhase({
   busyLine: string | null;
   simError: string | null;
   signPhase: SignPhase;
+  /** Chain-derived network-fee estimate (null while reading). */
+  txFeeEstimate: number | null;
   connected: boolean;
   connecting: boolean;
   availableWallets: string[];
@@ -1030,7 +1099,10 @@ function PreviewPhase({
                 : "—"
             }
           />
-          <Row k="Network fee (est.)" v={`${lamportsToSol(ESTIMATED_SOL_FEE_LAMPORTS)} SOL`} />
+          <Row
+            k="Network fee (est.)"
+            v={txFeeEstimate !== null ? `${lamportsToSol(txFeeEstimate)} SOL` : "reading…"}
+          />
         </div>
       </Card>
 

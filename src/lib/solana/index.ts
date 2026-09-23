@@ -46,6 +46,5 @@ export {
 export {
   readWalletBalance,
   lamportsToSol,
-  ESTIMATED_SOL_FEE_LAMPORTS,
   type WalletBalance,
 } from "./balance";
