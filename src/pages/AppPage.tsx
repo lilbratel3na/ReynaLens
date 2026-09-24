@@ -66,7 +66,17 @@ import {
   saveTransferIntent,
   loadTransferIntent,
   clearTransferIntent,
+  loadSubmittedSignature,
+  saveSubmittedSignature,
+  clearSubmittedSignature,
 } from "@/lib/transferIntent";
+import {
+  broadcastSignedTransaction,
+  createSubmissionGuard,
+  describeSignFailure,
+  signWithWallet,
+  type SignFailure,
+} from "@/lib/walletSign";
 import { useWalletConnect } from "@/hooks/use-wallet-connect";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -96,7 +106,7 @@ export default function AppPage() {
     disconnectWallet,
   } = useWalletConnect();
 
-  const { sendTransaction } = useWallet();
+  const { signTransaction } = useWallet();
 
   const recipientRows = useQuery(api.recipients.listRecipients);
   const recordRecipient = useMutation(api.recipients.recordVerifiedRecipient);
@@ -122,6 +132,8 @@ export default function AppPage() {
   const [signPhase, setSignPhase] = useState<SignPhase>("idle");
   /** Explicit user consent between a successful simulation and the signature. */
   const confirmedReadyRef = useRef(false);
+  /** Single-use broadcast guard: at most ONE submission per signed transaction. */
+  const submissionGuardRef = useRef(createSubmissionGuard());
 
   const owner = walletAddress ? new PublicKey(walletAddress) : null;
   const mintPubkey = useMemo(() => (asset ? new PublicKey(asset.mint) : null), [asset]);
@@ -349,6 +361,68 @@ export default function AppPage() {
 
   const exactOut = amountState?.state === "ok" ? amountState.out : null;
 
+  // ── Remount recovery for an already-submitted signature ──────────────────
+  // If a signed transaction was submitted but the app unmounted during
+  // confirmation (mobile deep-link return, reload, crash), continue confirming
+  // THAT signature. Never re-broadcasts: the submission guard is consumed for
+  // this session, so no path can submit the same transaction again. Runs once,
+  // after the restored intent has recomputed live state.
+  const recoveryRef = useRef(false);
+  useEffect(() => {
+    if (recoveryRef.current) return;
+    const sig = loadSubmittedSignature();
+    if (!sig) {
+      recoveryRef.current = true;
+      return;
+    }
+    // Wait until the restored transfer context is live before confirming.
+    if (phase !== "preview" || !mintInspection || !exactOut || !owner || !mintPubkey) return;
+    recoveryRef.current = true;
+    submissionGuardRef.current.acquire(); // this signature must never re-broadcast
+    setSignPhase("submitted");
+    setBusy(true);
+    setBusyLine("Confirming your earlier transaction…");
+    void (async () => {
+      try {
+        const confirmation = await confirmSignature(rpc, sig, 120_000);
+        if (!confirmation.ok) {
+          clearSubmittedSignature(); // terminal: failed on-chain or expired
+          setSignPhase("failed");
+          setSimError(
+            confirmation.error ??
+              "The earlier transaction did not confirm. Nothing was re-submitted; start a new transfer to try again.",
+          );
+          return;
+        }
+        setBusyLine("Verifying actual delivery…");
+        const recipientPk = new PublicKey(recipientInput.trim());
+        const destinationAta = deriveRecipientAta(recipientPk, mintPubkey);
+        const proof = await verifyDelivery({
+          connection: rpc,
+          destinationAta,
+          // After a remount the true pre-balance is unknowable; for a fresh
+          // recipient account (the normal case) the post balance IS the delta.
+          preBalanceBaseUnits: 0n,
+          requestedNet: exactOut.net,
+          signature: sig,
+        });
+        clearSubmittedSignature();
+        setSignPhase("confirmed");
+        setVerification(proof);
+        setFinalExactOut(exactOut);
+        setPhase("receipt");
+      } catch (e) {
+        setSignPhase("failed");
+        setSimError(friendlyRpcError(e instanceof Error ? e.message : String(e)));
+      } finally {
+        setBusy(false);
+        setBusyLine(null);
+      }
+    })();
+    // Recovery runs once per session, when the restored context is ready.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, mintInspection, exactOut, owner, mintPubkey]);
+
   const executeTransfer = useCallback(async () => {
     if (!owner || !asset || !mintInspection || !mintPubkey || !exactOut) {
       // Never a silent no-op: the user must see why nothing happened.
@@ -498,16 +572,76 @@ export default function AppPage() {
         : await readBalanceOrZero(rpc, destinationAta);
 
       setSignPhase("signing");
-      setBusyLine("Waiting for wallet signature…");
+      setBusyLine("Preparing signature request…");
+      // Fresh blockhash immediately before signing — the simulated transaction
+      // is never reused stale. Message bytes are captured AFTER pinning: this
+      // is the exact message the wallet is asked to sign, and the proof that
+      // the wallet returned it unmodified.
       const latest = await rpc.getLatestBlockhash("confirmed");
       const tx = built.transaction;
       tx.recentBlockhash = latest.blockhash;
       tx.feePayer = owner;
-      const sig = await sendTransaction(tx, rpc);
+      const msgBytes = tx.serializeMessage();
+      const resim = await simulateTransfer(rpc, tx, owner);
+      if (!resim.ok) {
+        const reason = resim.error ?? "Re-simulation of the signing transaction failed.";
+        setSignPhase("failed");
+        setSimError(reason);
+        toast.error("Transfer blocked", { description: reason });
+        return;
+      }
+
+      // ── SIGN ONLY (never sign-and-send) ──
+      // Mobile Phantom's signAndSend bridge drops the response after Confirm
+      // (diagnosed root cause of the silent failure). The supported, reliable
+      // method is signTransaction: the wallet returns the signed transaction,
+      // proving it signed, and ReynaLens broadcasts exactly once itself.
+      setBusyLine("Waiting for wallet signature…");
+      const signedTx = await signWithWallet(tx, { publicKey: owner, signTransaction }, msgBytes);
+
+      // Single-use guard, acquired at the last moment before broadcasting.
+      // A duplicate callback or remount that raced us is discarded here —
+      // never broadcast twice.
+      if (!submissionGuardRef.current.acquire()) {
+        setSignPhase("failed");
+        setSimError(
+          "A transaction from this session was already submitted. Start a new transfer to sign again.",
+        );
+        return;
+      }
+      setBusyLine("Submitting transaction…");
+      let sig: string;
+      try {
+        sig = await broadcastSignedTransaction(rpc, signedTx);
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        setSignPhase("failed");
+        setSimError(`Submission failed: ${friendlyRpcError(reason)}`);
+        toast.error("Submission failed", { description: friendlyRpcError(reason) });
+        return;
+      }
+      // Persist BEFORE polling: a crash/remount continues confirming THIS
+      // signature and never submits again.
+      saveSubmittedSignature(sig);
 
       setSignPhase("submitted");
       setBusyLine("Confirming on Solana…");
-      const confirmation = await confirmSignature(rpc, sig);
+      // Confirm the exact submitted signature. If the first window expires but
+      // the blockhash is still valid, keep polling the SAME signature — never
+      // rebuild or re-send automatically.
+      let confirmation = await confirmSignature(rpc, sig);
+      if (!confirmation.ok) {
+        let currentHeight: number | null = null;
+        try {
+          currentHeight = await rpc.getBlockHeight("confirmed");
+        } catch {
+          currentHeight = null;
+        }
+        const expired = currentHeight !== null && currentHeight > latest.lastValidBlockHeight;
+        if (!expired) {
+          confirmation = await confirmSignature(rpc, sig, 120_000);
+        }
+      }
       if (!confirmation.ok) {
         const reason =
           confirmation.error ??
@@ -554,16 +688,28 @@ export default function AppPage() {
       }
 
       setPhase("receipt");
+      clearSubmittedSignature();
       if (!proof.matchesRequested) {
         toast.error("Delivery mismatch", {
           description: "The verified amount differs from the request. Review the receipt.",
         });
       }
     } catch (e) {
+      // Typed signing failures (rejection / bridge drop / no signature /
+      // no signer) get their precise, user-safe description; RPC-level
+      // staleness is called out explicitly. Nothing here auto-retries.
+      const signFail = e as Partial<SignFailure> | null;
       const msg = e instanceof Error ? e.message : String(e);
-      const friendly = /rejected|denied|declined/i.test(msg)
-        ? "You rejected the transaction in your wallet. Nothing was sent."
-        : friendlyRpcError(msg);
+      let friendly: string;
+      if (signFail && typeof signFail === "object" && "reason" in signFail && signFail.reason) {
+        friendly = describeSignFailure(signFail.reason);
+      } else if (/rejected|denied|declined|dismissed/i.test(msg)) {
+        friendly = "You rejected the transaction in your wallet. Nothing was sent.";
+      } else if (/blockhash not found|block height exceeded|expired/i.test(msg)) {
+        friendly = describeSignFailure("blockhash_expired");
+      } else {
+        friendly = friendlyRpcError(msg);
+      }
       setSimError(friendly);
       setSignPhase("failed");
       toast.error("Transfer failed", { description: friendly });
@@ -573,7 +719,7 @@ export default function AppPage() {
     }
   }, [
     owner, asset, mintInspection, mintPubkey, exactOut, shieldVerdict,
-    knownRecipients, sourceAta, recipientInput, sendTransaction, recordRecipient,
+    knownRecipients, sourceAta, recipientInput, signTransaction, recordRecipient,
     saveReceiptMut,
   ]);
 
@@ -595,6 +741,10 @@ export default function AppPage() {
     !shieldLoading;
 
   const startNewTransfer = () => {
+    // Explicit new-user-action reset: fresh submission guard, and any pending
+    // submitted signature is abandoned (its confirmation state is cleared).
+    submissionGuardRef.current = createSubmissionGuard();
+    clearSubmittedSignature();
     setAsset(null);
     setMintInspection(null);
     setInspectError(null);
@@ -1223,7 +1373,7 @@ function PreviewPhase({
           <>
             <p className="text-xs leading-5 text-muted-foreground">
               From {owner ? shortenAddress(owner.toBase58(), 4) : "your wallet"} ·
-              the wallet was not asked to sign.
+              Nothing was signed or submitted.
             </p>
             <Button
               variant="outline"
@@ -1251,9 +1401,6 @@ function PreviewPhase({
         {simError &&
           ![
             "ready",
-            "insufficient_token",
-            "insufficient_sol",
-            "failed",
           ].includes(signPhase) && (
             <p className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs leading-5 text-destructive">
               {simError}

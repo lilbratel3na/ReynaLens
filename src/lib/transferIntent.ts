@@ -78,3 +78,45 @@ export function clearTransferIntent(storage?: Storage): void {
     /* best-effort */
   }
 }
+
+const SUBMITTED_KEY = "reynalens.submittedSignature.v1";
+
+/**
+ * Persist a signature that has been SUBMITTED to the network. Recovery then
+ * confirms THAT signature only — never re-broadcasts. Cleared when the
+ * transfer completes with a verified receipt.
+ */
+export function saveSubmittedSignature(signature: string, storage?: Storage): void {
+  const s = storage ?? defaultStorage();
+  if (!s) return;
+  try {
+    s.setItem(SUBMITTED_KEY, JSON.stringify({ v: 1, signature }));
+  } catch {
+    /* best-effort */
+  }
+}
+
+export function loadSubmittedSignature(storage?: Storage): string | null {
+  const s = storage ?? defaultStorage();
+  if (!s) return null;
+  try {
+    const raw = s.getItem(SUBMITTED_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const sig = (parsed as Record<string, unknown>).signature;
+    return typeof sig === "string" && sig.length > 0 ? sig : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearSubmittedSignature(storage?: Storage): void {
+  const s = storage ?? defaultStorage();
+  if (!s) return;
+  try {
+    s.removeItem(SUBMITTED_KEY);
+  } catch {
+    /* best-effort */
+  }
+}

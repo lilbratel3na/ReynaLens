@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  clearSubmittedSignature,
   clearTransferIntent,
+  loadSubmittedSignature,
   loadTransferIntent,
+  saveSubmittedSignature,
   saveTransferIntent,
 } from "./transferIntent";
 
@@ -84,5 +87,54 @@ describe("transferIntent persistence", () => {
     expect(() => saveTransferIntent(INTENT, throwing)).not.toThrow();
     expect(loadTransferIntent(throwing)).toBeNull();
     expect(() => clearTransferIntent(throwing)).not.toThrow();
+  });
+});
+
+describe("submitted signature persistence (remount recovery)", () => {
+  const SIG = "5UVdKaQ9y5smqvivotNQfQLiWkG7TvzczuoxQnCBmuLZJxUGS5jzGTU3UBTVhBcMbZoLmHsMbcV7sDTPZHnpiFj4";
+
+  it("round-trips a submitted signature", () => {
+    const s = memoryStorage();
+    saveSubmittedSignature(SIG, s);
+    expect(loadSubmittedSignature(s)).toBe(SIG);
+  });
+
+  it("returns null when nothing stored, and tolerates malformed JSON", () => {
+    const s = memoryStorage();
+    expect(loadSubmittedSignature(s)).toBeNull();
+    s.setItem("reynalens.submittedSignature.v1", "{oops");
+    expect(loadSubmittedSignature(s)).toBeNull();
+  });
+
+  it("discards empty or non-string signatures", () => {
+    const s = memoryStorage();
+    s.setItem("reynalens.submittedSignature.v1", JSON.stringify({ v: 1, signature: "" }));
+    expect(loadSubmittedSignature(s)).toBeNull();
+    s.setItem("reynalens.submittedSignature.v1", JSON.stringify({ v: 1, signature: 42 }));
+    expect(loadSubmittedSignature(s)).toBeNull();
+  });
+
+  it("clear removes the submitted signature (remount → no stale recovery)", () => {
+    const s = memoryStorage();
+    saveSubmittedSignature(SIG, s);
+    clearSubmittedSignature(s);
+    expect(loadSubmittedSignature(s)).toBeNull();
+  });
+
+  it("tolerates a throwing storage", () => {
+    const throwing = {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("blocked");
+      },
+      removeItem: () => {
+        throw new Error("blocked");
+      },
+    } as unknown as Storage;
+    expect(() => saveSubmittedSignature(SIG, throwing)).not.toThrow();
+    expect(loadSubmittedSignature(throwing)).toBeNull();
+    expect(() => clearSubmittedSignature(throwing)).not.toThrow();
   });
 });
