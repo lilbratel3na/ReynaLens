@@ -19,7 +19,19 @@
  * - If no usable signed transaction is returned, NOTHING is submitted and the
  *   real error is surfaced via a typed taxonomy.
  */
-import { Transaction, type Connection } from "@solana/web3.js";
+import {
+  Transaction,
+  VersionedTransaction,
+  type Connection,
+} from "@solana/web3.js";
+
+/**
+ * Same constant as web3.js's `VersionedMessage.deserializeMessageVersion` uses
+ * (installed source: src/transaction/constants.ts). Imported from the deep
+ * path where resolvable; duplicated here as a stable fallback so the wire-rule
+ * stays a single, documented value.
+ */
+const VERSION_PREFIX_MASK = 0x7f;
 
 /** Typed failure reasons, preserved through to the UI's error mapping. */
 export type SignFailureReason =
@@ -152,6 +164,113 @@ export function describeSignFailure(reason: SignFailureReason): string {
 export type SignableTransaction = Transaction;
 
 /**
+ * Normalize ANY value the installed wallet path may resolve with BEFORE the
+ * existing proof runs. Grounded in the installed web3.js 1.99.0 sources:
+ *
+ * - Legacy `Transaction` object → returned unchanged (case A).
+ * - `VersionedTransaction` object → passed through (has signatures + message,
+ *   no `verifySignatures` — the proof's crypto step is skipped for it exactly
+ *   as `SignedLike` already permits).
+ * - Serialized transaction BYTES (`Uint8Array`/`Buffer`/`ArrayBuffer`) → the
+ *   transaction wire format (both classes) is: shortvec signature count, N×64
+ *   signature bytes, then the message whose first byte carries the version
+ *   flag. Version discrimination applies the exact installed rule from
+ *   `VersionedMessage.deserializeMessageVersion` (`src/message/versioned.ts`)
+ *   to that MESSAGE byte: legacy iff `prefix & VERSION_PREFIX_MASK === prefix`.
+ *   For legacy bytes we require a single fee-payer signature (matching the
+ *   transaction ReynaLens builds) and use `Transaction.from(bytes)`; anything
+ *   else goes through `VersionedTransaction.deserialize(bytes)`, which itself
+ *   throws on versions other than 0/1. We never parse manually and never
+ *   guess from object properties — only the installed constructors run.
+ * - Envelope `{ signedTransaction: unknown }` (the only observed wallet-
+ *   standard field name) → unwrap and normalize recursively (case C).
+ * - falsy → null (preserves the existing no_signature_returned failure).
+ *
+ * Malformed bytes throw inside the installed constructors; the caller maps
+ * every throw to the existing typed failure. Nothing here weakens the proof:
+ * every normalized value still goes through proveSignedTransaction()
+ * unchanged.
+ */
+export function normalizeSignedTransactionReturn(value: unknown): NormalizedSigned | null {
+  return normalizeSigned(value, 0);
+}
+
+function normalizeSigned(value: unknown, depth: number): NormalizedSigned | null {
+  // Envelope recursion is bounded: the only legal nesting is one unwrap.
+  if (depth > 2) {
+    throw new Error("Wallet returned an unrecognized signed-transaction shape.");
+  }
+  // D) falsy → existing no_signature_returned failure.
+  if (value === null || value === undefined || value === false || value === 0 || value === "") {
+    return null;
+  }
+  // A) Legacy Transaction object — unchanged (also matches our own simulated tx type).
+  if (value instanceof Transaction) return { kind: "legacy", tx: value };
+  // VersionedTransaction object (no verifySignatures in web3.js 1.99.0).
+  if (value instanceof VersionedTransaction) return { kind: "versioned", tx: value };
+  // B) Serialized bytes (Uint8Array / Buffer / ArrayBuffer).
+  const bytes = toBytes(value);
+  if (bytes) {
+    // Transaction WIRE format (both classes, installed sources): shortvec
+    // signature count, then N×64 signature bytes, then the MESSAGE — whose
+    // first byte carries the version flag. Version discrimination therefore
+    // applies the installed `deserializeMessageVersion` rule to the first
+    // MESSAGE byte: legacy iff (prefix & VERSION_PREFIX_MASK) === prefix.
+    // ReynaLens always builds single-signature transactions, so the count is
+    // the single byte 0x01 and the message starts at offset 65.
+    const sigCount = bytes[0] & VERSION_PREFIX_MASK;
+    const msgPrefix = bytes[1 + sigCount * 64];
+    const isLegacy = msgPrefix !== undefined && (msgPrefix & VERSION_PREFIX_MASK) === msgPrefix;
+    if (isLegacy) {
+      if (sigCount !== 1) {
+        throw new Error(`Unexpected signature count ${sigCount} in signed transaction bytes.`);
+      }
+      return { kind: "legacy", tx: Transaction.from(bytes) };
+    }
+    // Versioned wire — the installed deserializer handles versions 0/1 and
+    // throws on anything else (fail-closed on malformed bytes).
+    return { kind: "versioned", tx: VersionedTransaction.deserialize(bytes) };
+  }
+  // A') Structural Transaction-like object (the existing SignedLike contract
+  // of proveSignedTransaction — e.g. adapter wrappers that hand back a
+  // transaction-shaped object). Accepted because the FULL existing proof
+  // (signature presence + message-byte equality + verifySignatures when
+  // offered) still runs on it unchanged.
+  if (
+    typeof value === "object" &&
+    typeof (value as SignedLike).serialize === "function" &&
+    ("signature" in (value as Record<string, unknown>) ||
+      "signatures" in (value as Record<string, unknown>))
+  ) {
+    return { kind: "legacy", tx: value as unknown as Transaction };
+  }
+  // C) Envelope object: unwrap ONLY the known signed-transaction field, then
+  // normalize recursively (A/B). No speculative provider behavior.
+  if (typeof value === "object" && "signedTransaction" in (value as Record<string, unknown>)) {
+    return normalizeSigned(
+      (value as { signedTransaction?: unknown }).signedTransaction,
+      depth + 1,
+    );
+  }
+  throw new Error("Wallet returned an unrecognized signed-transaction shape.");
+}
+
+/** Result of normalizing the wallet's returned value. */
+export type NormalizedSigned =
+  | { kind: "legacy"; tx: Transaction }
+  | { kind: "versioned"; tx: VersionedTransaction };
+
+/** Accept only genuine binary payloads; anything else is not transaction bytes. */
+function toBytes(value: unknown): Uint8Array | null {
+  if (value instanceof Uint8Array) return value;
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  return null;
+}
+
+/**
  * Pick the signing wallet to use. Desktop: the adapter's signTransaction.
  * Mobile: the injected Phantom provider's signTransaction when present (the
  * adapter resolves to it on mobile anyway, but reading the injected provider
@@ -186,7 +305,7 @@ export async function signWithWallet(
     signTransaction?: (tx: Transaction) => Promise<Transaction>;
   },
   expectedMessageBytes: Uint8Array,
-): Promise<Transaction> {
+): Promise<Transaction | VersionedTransaction> {
   if (!wallet.publicKey) {
     throw makeSignFailure("signer_unavailable", "Wallet is not connected.");
   }
@@ -197,14 +316,26 @@ export async function signWithWallet(
     );
   }
   try {
-    const signed = await wallet.signTransaction(transaction);
-    if (!proveSignedTransaction(signed, expectedMessageBytes)) {
+    const returned = await wallet.signTransaction(transaction);
+    // Normalize the wallet's return shape (bytes / envelope / Transaction)
+    // BEFORE proving. Grounded in the installed adapter: it delegates the
+    // return value verbatim, and the injected provider does not return a
+    // legacy Transaction object — this was the exact cause of the real-device
+    // "did not return a valid signed transaction" failure.
+    const normalized = normalizeSignedTransactionReturn(returned);
+    if (!normalized) {
+      throw makeSignFailure(
+        "no_signature_returned",
+        "The wallet did not return a signed transaction. Nothing was signed or submitted.",
+      );
+    }
+    if (!proveSignedTransaction(normalized.tx, expectedMessageBytes)) {
       throw makeSignFailure(
         "no_signature_returned",
         "The wallet did not return a valid signature for the exact transaction that was simulated. Nothing was signed or submitted.",
       );
     }
-    return signed;
+    return normalized.tx;
   } catch (e) {
     if (e instanceof Error && (e as SignFailure).reason) throw e; // already typed
     if (isRejectedSignatureError(e)) {
