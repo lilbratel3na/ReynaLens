@@ -249,19 +249,190 @@ export function formatWalletReturnDiagnostic(d: WalletReturnDiagnostic): string 
   return parts.join(" ");
 }
 
+/* ==========================================================================
+ * TEMPORARY P0 PROOF-STAGE DIAGNOSTIC (attempt #5)
+ * ==========================================================================
+ * The attempt-#4 device diagnostic proved Phantom returns a REAL signed
+ * legacy Transaction (signature=present, signatures=array(1)) — so the
+ * failure is inside proveSignedTransaction(). A local round-trip probe
+ * (scripts/probe-proof-stages.ts) proved a clean Transaction.from(bytes)
+ * passes ALL stages — so on device the returned MESSAGE BYTES must differ
+ * from what we simulated. This classifier reports ONLY booleans/numbers
+ * per the approved field list, never bytes/keys/secrets, and identifies
+ * the exact failing stage. The proof itself is unchanged.
+ */
+
+export type ProofStage =
+  | "shape"
+  | "signature_presence"
+  | "message_length"
+  | "message_integrity"
+  | "signature_verification"
+  | "other";
+
+export interface ProofDiagnostic {
+  hasSerialize: boolean;
+  hasSignature: boolean;
+  signatureLength: number;
+  signaturesLength: number;
+  simulatedMessageLength: number | null;
+  returnedMessageLength: number | null;
+  messageBytesEqual: boolean | null; // null when lengths differ (short-circuit)
+  verifySignaturesResult: boolean | null; // null when wallet provides no verifier
+  feePayerPresent: boolean;
+  recentBlockhashPresent: boolean;
+  instructionCount: number;
+  transactionVersion: string | null; // "legacy" | number | null when unavailable
+}
+
+/** Safe structural read of a legacy-or-versioned transaction-like object. */
+export function readProofFacts(
+  tx: unknown,
+  expectedMessageBytes: Uint8Array,
+): { facts: ProofDiagnostic; failedStage: ProofStage } {
+  const d: ProofDiagnostic = {
+    hasSerialize: false,
+    hasSignature: false,
+    signatureLength: 0,
+    signaturesLength: 0,
+    simulatedMessageLength: expectedMessageBytes.length,
+    returnedMessageLength: null,
+    messageBytesEqual: null,
+    verifySignaturesResult: null,
+    feePayerPresent: false,
+    recentBlockhashPresent: false,
+    instructionCount: 0,
+    transactionVersion: null,
+  };
+  const obj = tx as
+    | {
+        serialize?: unknown;
+        signature?: unknown;
+        signatures?: unknown;
+        serializeMessage?: unknown;
+        message?: { serialize?: unknown; version?: unknown };
+        verifySignatures?: unknown;
+        feePayer?: unknown;
+        recentBlockhash?: unknown;
+        instructions?: unknown[];
+        version?: unknown;
+      }
+    | null;
+  if (!tx || obj === null || typeof obj !== "object") {
+    return { facts: d, failedStage: "shape" };
+  }
+  d.hasSerialize = typeof obj.serialize === "function";
+  if (!d.hasSerialize) return { facts: d, failedStage: "shape" };
+
+  // ── Gather ALL facts first (values only), then evaluate stages in order.
+  // This way the device report contains every requested field regardless of
+  // which stage failed — e.g. verifySignatures=true + messageBytesEqual=false
+  // is the decisive wallet-re-signed-a-modified-message signature.
+
+  // Signature presence (legacy getter or signatures[0].signature).
+  const first = Array.isArray(obj.signatures) && obj.signatures.length > 0 ? obj.signatures[0] : undefined;
+  const sig: Uint8Array | null | undefined =
+    (obj.signature as Uint8Array | null | undefined) ??
+    (first instanceof Uint8Array ? first : (first?.signature ?? null));
+  d.hasSignature = !!sig;
+  d.signatureLength = sig ? sig.length : 0;
+  d.signaturesLength = Array.isArray(obj.signatures) ? obj.signatures.length : 0;
+
+  // Structural facts.
+  d.feePayerPresent = !!obj.feePayer;
+  d.recentBlockhashPresent = !!obj.recentBlockhash;
+  d.instructionCount = Array.isArray(obj.instructions) ? obj.instructions.length : 0;
+  if (typeof obj.version !== "undefined" && obj.version !== null) {
+    d.transactionVersion = String(obj.version);
+  } else if (obj.recentBlockhash !== undefined) {
+    d.transactionVersion = "legacy";
+  }
+
+  // Message byte comparison — the exact bytes that were simulated.
+  let msg: Uint8Array | null = null;
+  if (typeof obj.serializeMessage === "function") msg = obj.serializeMessage();
+  else if (obj.message && typeof obj.message.serialize === "function") {
+    msg = obj.message.serialize();
+  }
+  if (msg) {
+    d.returnedMessageLength = msg.length;
+    d.messageBytesEqual = msg.length === expectedMessageBytes.length;
+    if (d.messageBytesEqual) {
+      for (let i = 0; i < msg.length; i++) {
+        if (msg[i] !== expectedMessageBytes[i]) {
+          d.messageBytesEqual = false;
+          break;
+        }
+      }
+    }
+  }
+
+  // Cryptographic verification when the wallet provides it.
+  if (typeof obj.verifySignatures === "function") {
+    try {
+      d.verifySignaturesResult = !!obj.verifySignatures();
+    } catch {
+      d.verifySignaturesResult = false;
+    }
+  }
+
+  // ── Stage evaluation (proof order; proof itself unchanged elsewhere).
+  if (!sig || sig.length === 0 || sig.every((b) => b === 0)) {
+    return { facts: d, failedStage: "signature_presence" };
+  }
+  if (msg) {
+    if (msg.length !== expectedMessageBytes.length) {
+      return { facts: d, failedStage: "message_length" };
+    }
+    if (!d.messageBytesEqual) return { facts: d, failedStage: "message_integrity" };
+  }
+  if (d.verifySignaturesResult === false) {
+    return { facts: d, failedStage: "signature_verification" };
+  }
+  return { facts: d, failedStage: "other" };
+}
+
+/** One-line, value-free proof-stage summary for the UI failure message. */
+export function formatProofDiagnostic(d: ProofDiagnostic, stage: ProofStage): string {
+  return [
+    `stage=${stage}`,
+    `hasSerialize=${d.hasSerialize}`,
+    `hasSignature=${d.hasSignature}`,
+    `signatureLength=${d.signatureLength}`,
+    `signaturesLength=${d.signaturesLength}`,
+    `simulatedMessageLength=${d.simulatedMessageLength}`,
+    `returnedMessageLength=${d.returnedMessageLength ?? "n/a"}`,
+    `messageBytesEqual=${d.messageBytesEqual ?? "n/a"}`,
+    `verifySignatures=${d.verifySignaturesResult ?? "n/a"}`,
+    `feePayerPresent=${d.feePayerPresent}`,
+    `recentBlockhashPresent=${d.recentBlockhashPresent}`,
+    `instructionCount=${d.instructionCount}`,
+    `version=${d.transactionVersion ?? "n/a"}`,
+  ].join(" ");
+}
+
 /** TEMPORARY: the latest attempt's safe structural diagnostic (module-scoped so
  * describeSignFailure — called by the UI with only the reason — can append it).
  * Single-user app; signing attempts are strictly sequential. */
 let lastWalletReturnDiagnostic: string | null = null;
 
-/** TEMPORARY: clears the captured diagnostic (used by tests). */
+/** TEMPORARY: safe proof-stage diagnostic (same module-scoped pattern). */
+let lastProofDiagnostic: string | null = null;
+
+/** TEMPORARY: clears captured diagnostics (used by tests). */
 export function resetWalletReturnDiagnostic(): void {
   lastWalletReturnDiagnostic = null;
+  lastProofDiagnostic = null;
 }
 
-/** TEMPORARY: the captured diagnostic for the latest signing attempt, if any. */
+/** TEMPORARY: the captured wallet-return diagnostic for the latest attempt. */
 export function getLastWalletReturnDiagnostic(): string | null {
   return lastWalletReturnDiagnostic;
+}
+
+/** TEMPORARY: the captured proof-stage diagnostic for the latest attempt. */
+export function getLastProofDiagnostic(): string | null {
+  return lastProofDiagnostic;
 }
 
 /** Readable text for each typed failure, safe to render in the UI. */
@@ -282,10 +453,12 @@ export function describeSignFailure(reason: SignFailureReason): string {
         return "The network rejected the transaction submission.";
     }
   })();
-  // TEMPORARY (attempt #4): append THIS attempt's safe structural diagnostic so
-  // the real return shape becomes observable on device.
-  const diag = lastWalletReturnDiagnostic;
-  return diag ? `${base} Wallet return diagnostic: ${diag}` : base;
+  // TEMPORARY (attempt #4/#5): append THIS attempt's safe diagnostics so the
+  // real return shape and the exact failing proof stage are observable on device.
+  const parts = [base];
+  if (lastWalletReturnDiagnostic) parts.push(`Wallet return diagnostic: ${lastWalletReturnDiagnostic}`);
+  if (lastProofDiagnostic) parts.push(`Proof diagnostic: ${lastProofDiagnostic}`);
+  return parts.join(" ");
 }
 
 export type SignableTransaction = Transaction;
@@ -479,14 +652,20 @@ export async function signWithWallet(
       );
     }
     if (!proveSignedTransaction(normalized.tx, expectedMessageBytes)) {
+      // TEMPORARY proof-stage diagnostic: identify the EXACT failing stage
+      // with safe booleans/numbers only. The proof itself is unchanged.
+      const { facts, failedStage } = readProofFacts(normalized.tx, expectedMessageBytes);
+      const proofDiag = formatProofDiagnostic(facts, failedStage);
+      lastProofDiagnostic = proofDiag;
       throw makeSignFailure(
         "no_signature_returned",
-        `The wallet did not return a valid signature for the exact transaction that was simulated. Nothing was signed or submitted. Wallet return diagnostic: ${diagnostic}`,
+        `The wallet did not return a valid signature for the exact transaction that was simulated. Nothing was signed or submitted. Wallet return diagnostic: ${diagnostic} Proof diagnostic: ${proofDiag}`,
       );
     }
-    // Proven. The diagnostic served its purpose; a later failure in THIS
+    // Proven. The diagnostics served their purpose; a later failure in THIS
     // attempt (e.g. broadcast_failed) must not display a signing-shape note.
     lastWalletReturnDiagnostic = null;
+    lastProofDiagnostic = null;
     return normalized.tx;
   } catch (e) {
     if (e instanceof Error && (e as SignFailure).reason) throw e; // already typed

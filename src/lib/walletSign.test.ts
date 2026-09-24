@@ -13,9 +13,12 @@ import {
   classifyWalletReturn,
   describeSignFailure,
   extractSigningWalletSource,
+  formatProofDiagnostic,
   formatWalletReturnDiagnostic,
+  getLastProofDiagnostic,
   getLastWalletReturnDiagnostic,
   proveSignedTransaction,
+  readProofFacts,
   resetWalletReturnDiagnostic,
   signWithWallet,
   normalizeSignedTransactionReturn,
@@ -538,6 +541,111 @@ describe("classifyWalletReturn (safe structural diagnostic, attempt #4)", () => 
     const signed = await signWithWallet(tx, wallet, new Uint8Array(msgBytes));
     expect(signed).toBeTruthy();
   });
+});
+
+describe("readProofFacts / formatProofDiagnostic (attempt #5, safe values only)", () => {
+  const payer = Keypair.generate();
+  const to = Keypair.generate().publicKey;
+
+  function buildPinned(): { tx: Transaction; expected: Uint8Array } {
+    const tx = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 1000 }),
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: to, lamports: 1 }),
+    );
+    tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
+    tx.feePayer = payer.publicKey;
+    return { tx, expected: tx.serializeMessage() }; // captured BEFORE signing
+  }
+
+  it("clean round-trip Transaction passes ALL stages (probe parity)", () => {
+    const { tx, expected } = buildPinned();
+    tx.sign(payer);
+    const returned = Transaction.from(tx.serialize()); // injected-bridge round trip
+    const { facts, failedStage } = readProofFacts(returned, expected);
+    expect(failedStage).toBe("other"); // no stage failed
+    expect(facts.messageBytesEqual).toBe(true);
+    expect(facts.verifySignaturesResult).toBe(true);
+    expect(facts.signatureLength).toBe(64);
+    expect(facts.signaturesLength).toBe(1);
+    expect(facts.feePayerPresent).toBe(true);
+    expect(facts.recentBlockhashPresent).toBe(true);
+    expect(facts.instructionCount).toBe(2); // compute-limit + transfer
+    expect(facts.transactionVersion).toBe("legacy");
+  });
+
+  it("blockhash-replacement scenario → fails message_integrity with equal lengths", () => {
+    // Simulate the known mobile-wallet behavior: the wallet re-pins the
+    // recentBlockhash and re-signs BEFORE returning (same message LENGTH,
+    // different bytes).
+    const { tx, expected } = buildPinned();
+    const originalHash = tx.recentBlockhash;
+    tx.recentBlockhash = Keypair.generate().publicKey.toBase58(); // wallet replaces
+    tx.sign(payer);
+    const returned = Transaction.from(tx.serialize());
+    const { facts, failedStage } = readProofFacts(returned, expected);
+    expect(failedStage).toBe("message_integrity");
+    expect(facts.returnedMessageLength).toBe(expected.length); // same length
+    expect(facts.messageBytesEqual).toBe(false);
+    expect(facts.verifySignaturesResult).toBe(true); // the wallet's own sig IS valid
+    // Diagnostic line carries the required fields, values only.
+    const line = formatProofDiagnostic(facts, failedStage);
+    expect(line).toContain("stage=message_integrity");
+    expect(line).toContain(`simulatedMessageLength=${expected.length}`);
+    expect(line).toContain(`returnedMessageLength=${expected.length}`);
+    expect(line).toContain("messageBytesEqual=false");
+    expect(line).toContain("verifySignatures=true");
+    expect(line).toContain("version=legacy");
+    // Re-pinning back restores proof parity (the documented fix direction).
+    expect(originalHash).toBeTruthy();
+  });
+
+  it("signature-absent case → stage=signature_presence", () => {
+    const { tx, expected } = buildPinned();
+    // A parsed message alone yields an EMPTY signatures array (Transaction.from
+    // needs wire bytes). This mirrors a wallet handing back an unsigned object.
+    const returned = Transaction.populate(
+      tx.compileMessage(),
+      [] // zero signatures
+    );
+    const { facts, failedStage } = readProofFacts(returned, expected);
+    expect(failedStage).toBe("signature_presence");
+    expect(facts.hasSignature).toBe(false);
+  });
+
+  it("diagnostic NEVER contains signature/message bytes", () => {
+    const { tx, expected } = buildPinned();
+    tx.sign(payer);
+    const returned = Transaction.from(tx.serialize());
+    const { facts } = readProofFacts(returned, expected);
+    const serialized = JSON.stringify(facts);
+    const sigHex = Buffer.from(tx.signatures[0].signature!).toString("hex");
+    expect(serialized).not.toContain(sigHex.slice(0, 16));
+    const msgHex = Buffer.from(expected).toString("hex");
+    expect(serialized).not.toContain(msgHex.slice(0, 16));
+  });
+
+  it("signWithWallet embeds the proof diagnostic on proof failure (device path)", async () => {
+    resetWalletReturnDiagnostic();
+    const { tx, expected } = buildPinned();
+    // Wallet replaces the blockhash and re-signs before returning.
+    tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
+    tx.sign(payer);
+    const bytes = tx.serialize();
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => Transaction.from(bytes) as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+    const captured = getLastProofDiagnostic();
+    expect(captured).toContain("stage=message_integrity");
+    expect(captured).toContain("messageBytesEqual=false");
+    // And the UI path (describeSignFailure) surfaces it without AppPage changes.
+    expect(describeSignFailure("no_signature_returned")).toContain("Proof diagnostic:");
+    resetWalletReturnDiagnostic();
+  });
+
 });
 
 describe("extractSigningWalletSource", () => {
