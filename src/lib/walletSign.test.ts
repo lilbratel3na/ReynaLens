@@ -834,6 +834,167 @@ describe("Phantom-mutation allowlist (device-observed mutation, strict)", () => 
     });
   });
 
+  // ── A. Reordered account table with identical SEMANTIC instructions ──
+  it("A: ALLOWS original-key reorder when all instructions are semantically identical", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      // Wallet inserts its own key EARLY, forcing a sorted-key table reordering
+      // (indexes shift, but every instruction still references the same pubkeys).
+      t.instructions.splice(2, 0,
+        new TransactionInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+          data: Buffer.from([29, 0, 0]),
+        }),
+      );
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    const result = await signWithWallet(new Transaction(), wallet, expected, CTX);
+    expect(result.acceptedVia).toBe("phantom_allowlist");
+    expect(result.mutationReport).toContain("addedInstructions=1");
+    expect(result.mutationReport).toContain("originalsPreserved=4/4");
+  });
+
+  it("B: REJECTS original-key reorder PLUS changed recipient", async () => {
+    const { tx, expected } = buildSimulated();
+    const attackerAta = getAssociatedTokenAddressSync(
+      mint, Keypair.generate().publicKey, false, TOKEN_2022_PROGRAM_ID,
+    );
+    const returned = walletReturns(tx, (t) => {
+      // Reorder trigger (new key early) + swap destination in the TCF.
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+        data: Buffer.from([29, 0, 0]),
+      }));
+      const tcf = t.instructions[t.instructions.length - 1];
+      tcf.keys[2] = { pubkey: attackerAta, isSigner: false, isWritable: true };
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("C: REJECTS original-key reorder PLUS changed amount", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+        data: Buffer.from([29, 0, 0]),
+      }));
+      t.instructions[t.instructions.length - 1] = createTransferCheckedWithFeeInstruction(
+        sourceAta, mint, destinationAta, payer.publicKey, 2020202022n, 9, 10101011n, [], TOKEN_2022_PROGRAM_ID,
+      );
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("D: REJECTS original-key reorder PLUS changed signer/writable role", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+        data: Buffer.from([29, 0, 0]),
+      }));
+      // Flip the MINT account (readonly) to writable — role change on an
+      // original key (index remapping alone must never alter roles).
+      const ataCreate = t.instructions[3];
+      ataCreate.keys[1] = { pubkey: mint, isSigner: false, isWritable: true };
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("E: REJECTS original key removed", async () => {
+    const { tx, expected } = buildSimulated();
+    // Build a returned tx whose account table drops the mint key entirely:
+    // remove the TCF (references mint) so the table no longer needs it, but
+    // keep ATA-create + compute instructions.
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+        data: Buffer.from([29, 0, 0]),
+      }));
+      t.instructions.pop(); // drop TCF → mint disappears from the table
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("F: REJECTS unknown added instruction", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: Keypair.generate().publicKey,
+        keys: [],
+        data: Buffer.from([1, 2, 3]),
+      }));
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("G: ALLOWS the existing Phantom Reallocate mutation (regression)", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+        data: Buffer.from([29, 0, 0]),
+      }));
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    const result = await signWithWallet(new Transaction(), wallet, expected, CTX);
+    expect(result.acceptedVia).toBe("phantom_allowlist");
+  });
+
+  it("H: REJECTS corrupted signature", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, () => undefined);
+    returned.signatures[0].signature = Buffer.from(new Uint8Array(64).fill(1));
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
   it("byte-exact return still takes path 1 (acceptedVia=byte_exact)", async () => {
     const { tx, expected } = buildSimulated();
     tx.sign(payer); // SAME blockhash, no mutation

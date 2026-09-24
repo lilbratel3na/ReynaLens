@@ -886,22 +886,53 @@ export function evaluatePhantomMutation(
     return fail(`header numRequiredSignatures changed ${simMsg.header.numRequiredSignatures} → ${ret.header.numRequiredSignatures}`);
   }
 
-  // ── Key-set diff: no originals removed; relative order preserved. ──
+  // ── Key-set diff: SEMANTIC identity, not positional order. ──
+  // The device proved Phantom may reorder the account table when adding its
+  // own keys (sorted-key optimization). Order is therefore NOT a security
+  // property — what matters is that every original key survives with an
+  // IDENTICAL signer/writable role, and that header classifications stay
+  // consistent with the roles of the keys actually present.
   const retSet = new Map(ret.keys.map((k, i) => [k, i]));
   const addedKeys: Array<{ key: string; index: number }> = [];
-  const retainedSimIndexInRet: number[] = [];
   for (let i = 0; i < simKeys.length; i++) {
-    const idx = retSet.get(simKeys[i]);
-    if (idx === undefined) return fail(`original account key removed: sim index ${i} (${simKeys[i].slice(0, 4)}…)`);
-    retainedSimIndexInRet.push(idx);
+    if (!retSet.has(simKeys[i])) {
+      return fail(`original account key removed: sim index ${i} (${simKeys[i].slice(0, 4)}…)`);
+    }
   }
   for (let i = 0; i < ret.keys.length; i++) {
     if (!simKeys.includes(ret.keys[i])) addedKeys.push({ key: ret.keys[i], index: i });
   }
-  const orderOk = retainedSimIndexInRet.every((v, i) => i === 0 || v > retainedSimIndexInRet[i - 1]);
-  if (!orderOk) return fail("original account keys were reordered");
 
-  // ── Instruction diff via pubkey identity (indexes remap; pubkeys don't). ──
+  // ── Role consistency: signer/writable classification must be identical for
+  // every ORIGINAL key, and consistent for every key in the returned table. ──
+  const roleOf = (header: CompiledSide["header"], keyCount: number, index: number) => {
+    const signedPart = header.numRequiredSignatures + header.numReadonlySignedAccounts;
+    const signer = index < header.numRequiredSignatures;
+    const writable = index < header.numRequiredSignatures
+      ? true
+      : index < signedPart
+        ? false
+        : index < keyCount - header.numReadonlyUnsignedAccounts;
+    return `${signer ? "signer" : "non-signer"}/${writable ? "writable" : "readonly"}`;
+  };
+  const retRoleByIndex = ret.keys.map((_k, i) => roleOf(ret.header, ret.keys.length, i));
+  const retRoleByKey = new Map(ret.keys.map((k, i) => [k, retRoleByIndex[i]]));
+  const simRoleByIndex = simKeys.map((_k, i) => roleOf(simMsg.header, simKeys.length, i));
+  for (let i = 0; i < simKeys.length; i++) {
+    const simRole = simRoleByIndex[i];
+    const retRole = retRoleByKey.get(simKeys[i]);
+    if (simRole !== retRole) {
+      return fail(`account role changed for ${simKeys[i].slice(0, 4)}…: ${simRole} → ${retRole}`);
+    }
+  }
+  // Fee payer must remain the FIRST key (Solana convention: index 0 pays).
+  // (Already checked above; roleOf handles the signer classification.)
+  void roleOf;
+
+  // ── Instruction diff via resolved PUBLIC-KEY identity (never raw indexes). ──
+  // An index change caused solely by account-table reordering is allowed. A
+  // change in the actual public-key account referenced by an instruction is
+  // NOT. Original instructions must appear in original relative order.
   type Cmp = { pid: string; accounts: number[]; data: Uint8Array };
   const simIxs: Cmp[] = simMsg.instructions.map((ix) => ({
     pid: simKeys[ix.programIdIndex],
@@ -911,19 +942,44 @@ export function evaluatePhantomMutation(
   const resolved = (keys: string[], ix: Cmp) =>
     `${ix.pid}|${ix.accounts.map((i) => keys[i]).join(",")}|${Buffer.from(ix.data).toString("hex")}`;
   const retIxs: Cmp[] = ret.ixs;
-  const matched = new Set<number>();
+  // Walk originals in order through the returned list (order-preserving match).
+  let retCursor = 0;
   const addedIxs: Cmp[] = [];
-  for (const rIx of retIxs) {
-    const sig = resolved(ret.keys, rIx);
-    const s = simIxs.findIndex((x, i) => !matched.has(i) && resolved(simKeys, x) === sig);
-    if (s >= 0) matched.add(s);
-    else addedIxs.push(rIx);
-  }
+  const originalsSkipped: number[] = [];
   for (let s = 0; s < simIxs.length; s++) {
-    if (!matched.has(s)) {
-      return fail(`original instruction #${s} (${describeOp(simIxs[s].pid, simIxs[s].data, simIxs[s].accounts)}) was removed or altered`);
+    const target = resolved(simKeys, simIxs[s]);
+    let found = -1;
+    for (let r = retCursor; r < retIxs.length; r++) {
+      if (resolved(ret.keys, retIxs[r]) === target) {
+        found = r;
+        break;
+      }
+    }
+    if (found === -1) {
+      return fail(`original instruction #${s} (${describeOp(simIxs[s].pid, simIxs[s].data, simIxs[s].accounts)}) was removed, altered, or reordered`);
+    }
+    for (; retCursor < found; retCursor++) {
+      originalsSkipped.push(retCursor);
+    }
+    retCursor = found + 1;
+  }
+  // Everything the cursor passed over that is NOT an original = added.
+  const matchedReturned = new Set<number>();
+  {
+    let c = 0;
+    for (let s = 0; s < simIxs.length; s++) {
+      const target = resolved(simKeys, simIxs[s]);
+      while (c < retIxs.length && resolved(ret.keys, retIxs[c]) !== target) c++;
+      if (c < retIxs.length) {
+        matchedReturned.add(c);
+        c++;
+      }
     }
   }
+  for (let r = 0; r < retIxs.length; r++) {
+    if (!matchedReturned.has(r)) addedIxs.push(retIxs[r]);
+  }
+  void originalsSkipped;
 
   // ── Transfer core invariants (decoded from the simulated TCF wire data). ──
   if (transferContext) {
@@ -955,7 +1011,7 @@ export function evaluatePhantomMutation(
 
   R.push(`addedInstructions=${addedIxs.length}(${addedIxs.map((ix) => describeOp(ix.pid, ix.data, ix.accounts)).join("; ")})`);
   R.push(`addedKeys=${addedKeys.length}`);
-  R.push(`originalsPreserved=${matched.size}/${simIxs.length}`);
+  R.push(`originalsPreserved=${simIxs.length}/${simIxs.length}`);
   R.push(`walletSignatureValid=${walletSignatureValid}`);
   return { verdict: "allow", report: R.join(" | ") };
 }
