@@ -3,9 +3,17 @@ import {
   Transaction,
   VersionedTransaction,
   Keypair,
+  PublicKey,
   SystemProgram,
   ComputeBudgetProgram,
+  TransactionInstruction,
 } from "@solana/web3.js";
+import {
+  TOKEN_2022_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountInstruction,
+  createTransferCheckedWithFeeInstruction,
+} from "@solana/spl-token";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
   broadcastSignedTransaction,
@@ -347,7 +355,7 @@ describe("normalizeSignedTransactionReturn (Phantom Android return shapes)", () 
         return "SIG_BYTES_OK";
       },
     } as never;
-    const sig = await broadcastSignedTransaction(connection, signed);
+    const sig = await broadcastSignedTransaction(connection, signed.tx);
     expect(sig).toBe("SIG_BYTES_OK");
     expect(calls).toBe(1);
   });
@@ -624,7 +632,7 @@ describe("readProofFacts / formatProofDiagnostic (attempt #5, safe values only)"
     expect(serialized).not.toContain(msgHex.slice(0, 16));
   });
 
-  it("signWithWallet embeds the proof diagnostic on proof failure (device path)", async () => {
+  it("blockhash-only re-pin → accepted via phantom_allowlist with empty mutation report", async () => {
     resetWalletReturnDiagnostic();
     const { tx, expected } = buildPinned();
     // Wallet replaces the blockhash and re-signs before returning.
@@ -635,17 +643,207 @@ describe("readProofFacts / formatProofDiagnostic (attempt #5, safe values only)"
       publicKey: { toBase58: () => payer.publicKey.toBase58() },
       signTransaction: async () => Transaction.from(bytes) as unknown as Transaction,
     };
-    await expect(signWithWallet(new Transaction(), wallet, expected)).rejects.toMatchObject({
-      reason: "no_signature_returned",
-    });
-    const captured = getLastProofDiagnostic();
-    expect(captured).toContain("stage=message_integrity");
-    expect(captured).toContain("messageBytesEqual=false");
-    // And the UI path (describeSignFailure) surfaces it without AppPage changes.
-    expect(describeSignFailure("no_signature_returned")).toContain("Proof diagnostic:");
+    const result = await signWithWallet(new Transaction(), wallet, expected);
+    expect(result.acceptedVia).toBe("phantom_allowlist");
+    expect(result.mutationReport).toContain("addedInstructions=0");
+    expect(result.mutationReport).toContain("addedKeys=0");
+    expect(result.mutationReport).toContain("originalsPreserved=2/2");
+    expect(result.mutationReport).toContain("walletSignatureValid=true");
+    // wireBase58 captured for local diagnostics (public wire data only).
+    expect(typeof result.wireBase58).toBe("string");
     resetWalletReturnDiagnostic();
   });
 
+});
+
+describe("Phantom-mutation allowlist (device-observed mutation, strict)", () => {
+  const payer = Keypair.generate();
+  const recipientOwner = Keypair.generate().publicKey;
+  const mint = new PublicKey("PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF");
+  const sourceAta = getAssociatedTokenAddressSync(mint, payer.publicKey, false, TOKEN_2022_PROGRAM_ID);
+  const destinationAta = getAssociatedTokenAddressSync(mint, recipientOwner, false, TOKEN_2022_PROGRAM_ID);
+  const CTX = {
+    sourceAta: sourceAta.toBase58(),
+    mint: mint.toBase58(),
+    destinationAta: destinationAta.toBase58(),
+    authority: payer.publicKey.toBase58(),
+    grossBaseUnits: "1010101011",
+    decimals: 9,
+    feeBaseUnits: "10101011",
+  };
+
+  function buildSimulated(): { tx: Transaction; expected: Uint8Array } {
+    const tx = new Transaction();
+    tx.add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 20_000 }),
+    );
+    tx.add(
+      createAssociatedTokenAccountInstruction(payer.publicKey, destinationAta, recipientOwner, mint, TOKEN_2022_PROGRAM_ID),
+    );
+    tx.add(
+      createTransferCheckedWithFeeInstruction(
+        sourceAta, mint, destinationAta, payer.publicKey, 1010101011n, 9, 10101011n, [], TOKEN_2022_PROGRAM_ID,
+      ),
+    );
+    tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
+    tx.feePayer = payer.publicKey;
+    return { tx, expected: tx.serializeMessage() };
+  }
+
+  function walletReturns(simulated: Transaction, mutate: (tx: Transaction) => void): Transaction {
+    const tx = new Transaction();
+    tx.feePayer = simulated.feePayer;
+    tx.recentBlockhash = Keypair.generate().publicKey.toBase58(); // re-pin (allowed)
+    for (const ix of simulated.instructions) tx.add(ix);
+    mutate(tx);
+    tx.sign(payer); // wallet signs its own message
+    return tx;
+  }
+
+  it("ALLOWS the device-observed shape: +2 Reallocate(1 extType) instructions, 1 new key each", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0,
+        new TransactionInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+          data: Buffer.from([29, 0, 0]), // Reallocate, 1 extension type
+        }),
+        new TransactionInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: false }],
+          data: Buffer.from([29, 0, 0]),
+        }),
+      );
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    const result = await signWithWallet(new Transaction(), wallet, expected, CTX);
+    expect(result.acceptedVia).toBe("phantom_allowlist");
+    expect(result.mutationReport).toContain("addedInstructions=2");
+    expect(result.mutationReport).toContain("Token2022.Reallocate");
+    expect(result.mutationReport).toContain("originalsPreserved=4/4");
+  });
+
+  it("REJECTS recipient ATA substitution inside the transfer instruction", async () => {
+    const { tx, expected } = buildSimulated();
+    const attackerAta = getAssociatedTokenAddressSync(
+      mint, Keypair.generate().publicKey, false, TOKEN_2022_PROGRAM_ID,
+    );
+    const returned = walletReturns(tx, (t) => {
+      const tcf = t.instructions[t.instructions.length - 1];
+      tcf.keys[2] = { pubkey: attackerAta, isSigner: false, isWritable: true }; // destination swapped
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("REJECTS amount tampering in the transfer instruction", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      // Rebuild the TCF with a doubled amount.
+      t.instructions[t.instructions.length - 1] = createTransferCheckedWithFeeInstruction(
+        sourceAta, mint, destinationAta, payer.publicKey, 2020202022n, 9, 10101011n, [], TOKEN_2022_PROGRAM_ID,
+      );
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("REJECTS unexpected programs (memo injection)", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.unshift(new TransactionInstruction({
+        programId: Keypair.generate().publicKey, // unknown program
+        keys: [],
+        data: Buffer.from([1, 2, 3]),
+      }));
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("REJECTS MemoTransfer.Enable (semantics-changing op even from Token-2022)", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [{ pubkey: destinationAta, isSigner: false, isWritable: true }], // existing key
+        data: Buffer.from([30, 1]), // MemoTransferExtension.Enable
+      }));
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("REJECTS fee payer substitution", async () => {
+    const { tx, expected } = buildSimulated();
+    const attacker = Keypair.generate();
+    const returned = walletReturns(tx, (t) => {
+      t.feePayer = attacker.publicKey;
+      t.instructions.unshift(
+        SystemProgram.transfer({ fromPubkey: attacker.publicKey, toPubkey: destinationAta, lamports: 1 }),
+      );
+    });
+    // Sign with the attacker's key so verifySignatures passes but payer differs.
+    returned.partialSign(attacker);
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("REJECTS invalid wallet signature even when structure matches", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, () => undefined); // shape identical, blockhash re-pin only
+    // Corrupt the signature bytes (kept length-identical).
+    const bad = Buffer.from(new Uint8Array(64).fill(1));
+    returned.signatures[0].signature = bad;
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+  });
+
+  it("byte-exact return still takes path 1 (acceptedVia=byte_exact)", async () => {
+    const { tx, expected } = buildSimulated();
+    tx.sign(payer); // SAME blockhash, no mutation
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => tx as unknown as Transaction,
+    };
+    const result = await signWithWallet(new Transaction(), wallet, expected, CTX);
+    expect(result.acceptedVia).toBe("byte_exact");
+  });
 });
 
 describe("extractSigningWalletSource", () => {

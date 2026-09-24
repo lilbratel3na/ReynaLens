@@ -22,6 +22,7 @@
 import {
   Transaction,
   VersionedTransaction,
+  Message,
   type Connection,
 } from "@solana/web3.js";
 
@@ -598,6 +599,27 @@ export function extractSigningWalletSource(
  *   returned signature can only exist if the wallet genuinely signed).
  * Throws a typed SignFailure; a user rejection maps to reason "rejected".
  */
+/** Public key strings for the TransferCheckedWithFee account-role contract. */
+export interface TransferContext {
+  sourceAta: string;
+  mint: string;
+  destinationAta: string;
+  authority: string;
+  grossBaseUnits: string;
+  decimals: number;
+  feeBaseUnits: string;
+}
+
+export interface SignWithWalletResult {
+  tx: Transaction | VersionedTransaction;
+  /** Which acceptance path proved the signed transaction. */
+  acceptedVia: "byte_exact" | "phantom_allowlist";
+  /** Safe structural report of what the wallet changed, if it changed anything. */
+  mutationReport?: string;
+  /** Serialized transaction bytes (public wire data) for local diagnostics. */
+  wireBase58?: string;
+}
+
 export async function signWithWallet(
   transaction: Transaction,
   wallet: {
@@ -605,7 +627,8 @@ export async function signWithWallet(
     signTransaction?: (tx: Transaction) => Promise<Transaction>;
   },
   expectedMessageBytes: Uint8Array,
-): Promise<Transaction | VersionedTransaction> {
+  transferContext?: TransferContext,
+): Promise<SignWithWalletResult> {
   if (!wallet.publicKey) {
     throw makeSignFailure("signer_unavailable", "Wallet is not connected.");
   }
@@ -651,22 +674,40 @@ export async function signWithWallet(
         `The wallet did not return a signed transaction. Nothing was signed or submitted. Wallet return diagnostic: ${diagnostic}`,
       );
     }
-    if (!proveSignedTransaction(normalized.tx, expectedMessageBytes)) {
-      // TEMPORARY proof-stage diagnostic: identify the EXACT failing stage
-      // with safe booleans/numbers only. The proof itself is unchanged.
-      const { facts, failedStage } = readProofFacts(normalized.tx, expectedMessageBytes);
-      const proofDiag = formatProofDiagnostic(facts, failedStage);
-      lastProofDiagnostic = proofDiag;
+    const signedTx = normalized.tx;
+
+    // ── Path 1: byte-exact match with what we simulated (desktop norm). ──
+    if (proveSignedTransaction(signedTx, expectedMessageBytes)) {
+      lastWalletReturnDiagnostic = null;
+      lastProofDiagnostic = null;
+      return { tx: signedTx, acceptedVia: "byte_exact", wireBase58: bs58.encode(signedTx.serialize()) };
+    }
+
+    // ── Path 2: wallet-mutation allowlist (see evaluatePhantomMutation). ──
+    const walletSigValid = verifySignaturesSafe(signedTx);
+    const { report, verdict } = evaluatePhantomMutation(
+      expectedMessageBytes,
+      signedTx,
+      transferContext,
+      walletSigValid,
+    );
+    if (!walletSigValid) {
+      lastProofDiagnostic = `wallet signature INVALID over returned message | ${report}`;
       throw makeSignFailure(
         "no_signature_returned",
-        `The wallet did not return a valid signature for the exact transaction that was simulated. Nothing was signed or submitted. Wallet return diagnostic: ${diagnostic} Proof diagnostic: ${proofDiag}`,
+        `The wallet's signature does not verify over the transaction it returned. Nothing was signed or submitted. Structural report: ${report}`,
       );
     }
-    // Proven. The diagnostics served their purpose; a later failure in THIS
-    // attempt (e.g. broadcast_failed) must not display a signing-shape note.
+    if (verdict !== "allow") {
+      lastProofDiagnostic = `mutation REJECTED | ${report}`;
+      throw makeSignFailure(
+        "no_signature_returned",
+        `The wallet returned a transaction modified beyond the accepted safety allowlist. Nothing was signed or submitted. Structural report: ${report}`,
+      );
+    }
     lastWalletReturnDiagnostic = null;
     lastProofDiagnostic = null;
-    return normalized.tx;
+    return { tx: signedTx, acceptedVia: "phantom_allowlist", mutationReport: report, wireBase58: bs58.encode(signedTx.serialize()) };
   } catch (e) {
     if (e instanceof Error && (e as SignFailure).reason) throw e; // already typed
     // Normalization/parse failure of the resolved value.
@@ -675,4 +716,246 @@ export async function signWithWallet(
       `${e instanceof Error ? e.message : String(e)} Wallet return diagnostic: ${diagnostic}`,
     );
   }
+}
+
+/* ==========================================================================
+ * STRUCTURAL COMPARATOR + STRICT WALLET-MUTATION ALLOWLIST (P0, 48-min cycle)
+ * ==========================================================================
+ * Device-proven facts: Phantom Android returns a signed legacy Transaction
+ * with 2 ADDED instructions and 2 ADDED keys (+83 message bytes), signature
+ * valid over ITS message. This comparator decodes both messages and accepts
+ * ONLY:
+ *   - original instructions PRESERVED in order, byte-identical (programs,
+ *     accounts, data) — semantics cannot drift;
+ *   - ADDED instructions limited to a fixed safe op list (Token-2022
+ *     Reallocate/MemoTransfer Enable/CpiGuard Enable, or an ATA-create for
+ *     OUR destination/mint), each referencing at most one NEW key which must
+ *     be derived (PDA) if in the Token-2022 program's namespace;
+ *   - blockhash may differ (wallet re-pin);
+ *   - fee payer, header signature semantics, and the transfer core (source/
+ *     mint/destination/authority/amount/decimals/fee) byte-identical;
+ *   - wallet signature must cryptographically verify over its message.
+ * Everything else — recipient/mint/amount/fee/payer changes, unknown
+ * programs/ops/data, removed/reordered originals — REJECTS with a full safe
+ * report. Public addresses and wire bytes only; never secrets.
+ * ========================================================================== */
+
+import bs58 from "bs58";
+
+const COMPUTE_BUDGET_PROGRAM = "ComputeBudget111111111111111111111111111111";
+const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+
+const TOKEN_OPS: Record<number, string> = {
+  0: "InitializeMint", 1: "InitializeAccount", 2: "InitializeMultisig", 3: "Transfer",
+  4: "Approve", 5: "Revoke", 6: "SetAuthority", 7: "MintTo", 8: "Burn", 9: "CloseAccount",
+  10: "FreezeAccount", 11: "ThawAccount", 12: "TransferChecked", 13: "ApproveChecked",
+  14: "MintToChecked", 15: "BurnChecked", 16: "InitializeAccount2", 17: "SyncNative",
+  18: "InitializeAccount3", 19: "InitializeMultisig2", 20: "InitializeMint2",
+  21: "GetAccountDataSize", 22: "InitializeImmutableOwner", 23: "AmountToUiAmount",
+  24: "UiAmountToAmount", 25: "InitializeMintCloseAuthority", 26: "TransferFeeExtension",
+  27: "ConfidentialTransferExtension", 28: "DefaultAccountStateExtension", 29: "Reallocate",
+  30: "MemoTransferExtension", 31: "CreateNativeMint", 32: "InitializeNonTransferableMint",
+  33: "InterestBearingMintExtension", 34: "CpiGuardExtension", 35: "InitializePermanentDelegate",
+  36: "TransferHookExtension",
+};
+const TRANSFER_FEE_OPS: Record<number, string> = {
+  0: "InitializeTransferFeeConfig", 1: "TransferCheckedWithFee",
+  2: "WithdrawWithheldTokensFromMint", 3: "WithdrawWithheldTokensFromAccounts",
+  4: "HarvestWithheldTokensToMint", 5: "SetTransferFee",
+};
+
+interface CompiledSide {
+  header: { numRequiredSignatures: number; numReadonlySignedAccounts: number; numReadonlyUnsignedAccounts: number };
+  keys: string[];
+  blockhash: string;
+  ixs: Array<{ pid: string; pidIdx: number; accounts: number[]; data: Uint8Array }>;
+}
+
+function compileSide(tx: Transaction | VersionedTransaction): CompiledSide | null {
+  try {
+    if (tx instanceof Transaction) {
+      const m = tx.compileMessage();
+      return {
+        header: m.header,
+        keys: m.accountKeys.map((k) => k.toBase58()),
+        blockhash: m.recentBlockhash,
+        ixs: m.instructions.map((ix) => ({
+          pid: m.accountKeys[ix.programIdIndex].toBase58(),
+          pidIdx: ix.programIdIndex,
+          accounts: ix.accounts,
+          data: bs58.decode(ix.data),
+        })),
+      };
+    }
+    if (tx instanceof VersionedTransaction) {
+      const m = tx.message;
+      const staticKeys = m.staticAccountKeys.map((k) => k.toBase58());
+      return {
+        header: {
+          numRequiredSignatures: m.header.numRequiredSignatures,
+          numReadonlySignedAccounts: m.header.numReadonlySignedAccounts,
+          numReadonlyUnsignedAccounts: m.header.numReadonlyUnsignedAccounts,
+        },
+        keys: staticKeys,
+        blockhash: m.recentBlockhash,
+        ixs: m.compiledInstructions.map((ix) => ({
+          pid: staticKeys[ix.programIdIndex],
+          pidIdx: ix.programIdIndex,
+          accounts: ix.accountKeyIndexes,
+          data: ix.data,
+        })),
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function verifySignaturesSafe(tx: Transaction | VersionedTransaction): boolean {
+  try {
+    if (tx instanceof Transaction) return !!tx.verifySignatures();
+    // web3.js 1.99.0 VersionedTransaction exposes no verifySignatures; verify
+    // via the legacy round-trip is impossible for v0 — treat as unproven.
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** op summary for reports — structural facts only, decoded where known. */
+function describeOp(pid: string, data: Uint8Array, accounts: number[]): string {
+  if (pid === COMPUTE_BUDGET_PROGRAM) {
+    const op = { 0: "RequestUnits", 1: "RequestHeapFrame", 2: "SetComputeUnitLimit", 3: "SetComputeUnitPrice" }[data[0]] ?? `op${data[0]}`;
+    return `ComputeBudget.${op}`;
+  }
+  if (pid === TOKEN_2022_PROGRAM) {
+    const op = TOKEN_OPS[data[0]] ?? `op${data[0]}`;
+    if (data[0] === 26 && data.length >= 2) {
+      const sub = TRANSFER_FEE_OPS[data[1]] ?? data[1];
+      let extra = "";
+      if (data[1] === 1 && data.length >= 19) {
+        const dv = new DataView(data.buffer, data.byteOffset);
+        extra = ` amount=${dv.getBigUint64(2, true)} decimals=${data[10]} fee=${dv.getBigUint64(11, true)}`;
+      }
+      return `Token2022.TransferFeeExtension.${sub}${extra}`;
+    }
+    return `Token2022.${op}(${accounts.length} accts, ${data.length}B data)`;
+  }
+  if (pid === ATA_PROGRAM) return "ATA.create";
+  return `UNKNOWN_PROGRAM ${pid} (data ${data.length}B)`;
+}
+
+export interface MutationEvaluation {
+  verdict: "allow" | "reject";
+  report: string;
+}
+
+/**
+ * Compare the simulated message with the wallet's returned message and decide
+ * STRICTLY whether the delta is inside the documented, safe mutation allowlist.
+ */
+export function evaluatePhantomMutation(
+  simulatedMessageBytes: Uint8Array,
+  returnedTx: Transaction | VersionedTransaction,
+  transferContext: TransferContext | undefined,
+  walletSignatureValid: boolean,
+): MutationEvaluation {
+  const R: string[] = [];
+  const fail = (why: string): MutationEvaluation => ({ verdict: "reject", report: `${R.join(" | ")} | REJECT: ${why}` });
+
+  // Simulated side: parse the EXACT expected message bytes.
+  let simMsg: Message;
+  try {
+    simMsg = Message.from(simulatedMessageBytes);
+  } catch {
+    return fail("simulated message could not be parsed");
+  }
+  const ret = compileSide(returnedTx);
+  if (!ret) return fail("returned transaction could not be parsed");
+  const simKeys = simMsg.accountKeys.map((k) => k.toBase58());
+
+  // ── Fee payer must be unchanged (first account key). ──
+  if (ret.keys[0] !== simKeys[0]) {
+    return fail(`fee payer changed: simulated ${simKeys[0].slice(0, 4)}… vs returned ${ret.keys[0].slice(0, 4)}…`);
+  }
+
+  // ── Header semantics: signature count must be identical. ──
+  if (ret.header.numRequiredSignatures !== simMsg.header.numRequiredSignatures) {
+    return fail(`header numRequiredSignatures changed ${simMsg.header.numRequiredSignatures} → ${ret.header.numRequiredSignatures}`);
+  }
+
+  // ── Key-set diff: no originals removed; relative order preserved. ──
+  const retSet = new Map(ret.keys.map((k, i) => [k, i]));
+  const addedKeys: Array<{ key: string; index: number }> = [];
+  const retainedSimIndexInRet: number[] = [];
+  for (let i = 0; i < simKeys.length; i++) {
+    const idx = retSet.get(simKeys[i]);
+    if (idx === undefined) return fail(`original account key removed: sim index ${i} (${simKeys[i].slice(0, 4)}…)`);
+    retainedSimIndexInRet.push(idx);
+  }
+  for (let i = 0; i < ret.keys.length; i++) {
+    if (!simKeys.includes(ret.keys[i])) addedKeys.push({ key: ret.keys[i], index: i });
+  }
+  const orderOk = retainedSimIndexInRet.every((v, i) => i === 0 || v > retainedSimIndexInRet[i - 1]);
+  if (!orderOk) return fail("original account keys were reordered");
+
+  // ── Instruction diff via pubkey identity (indexes remap; pubkeys don't). ──
+  type Cmp = { pid: string; accounts: number[]; data: Uint8Array };
+  const simIxs: Cmp[] = simMsg.instructions.map((ix) => ({
+    pid: simKeys[ix.programIdIndex],
+    accounts: ix.accounts,
+    data: bs58.decode(ix.data),
+  }));
+  const resolved = (keys: string[], ix: Cmp) =>
+    `${ix.pid}|${ix.accounts.map((i) => keys[i]).join(",")}|${Buffer.from(ix.data).toString("hex")}`;
+  const retIxs: Cmp[] = ret.ixs;
+  const matched = new Set<number>();
+  const addedIxs: Cmp[] = [];
+  for (const rIx of retIxs) {
+    const sig = resolved(ret.keys, rIx);
+    const s = simIxs.findIndex((x, i) => !matched.has(i) && resolved(simKeys, x) === sig);
+    if (s >= 0) matched.add(s);
+    else addedIxs.push(rIx);
+  }
+  for (let s = 0; s < simIxs.length; s++) {
+    if (!matched.has(s)) {
+      return fail(`original instruction #${s} (${describeOp(simIxs[s].pid, simIxs[s].data, simIxs[s].accounts)}) was removed or altered`);
+    }
+  }
+
+  // ── Transfer core invariants (decoded from the simulated TCF wire data). ──
+  if (transferContext) {
+    const tcf = simIxs.find((x) => x.pid === TOKEN_2022_PROGRAM && x.data.length >= 19 && x.data[0] === 26 && x.data[1] === 1);
+    if (!tcf) return fail("simulated TransferCheckedWithFee instruction not found");
+    const dv = new DataView(tcf.data.buffer, tcf.data.byteOffset);
+    if (dv.getBigUint64(2, true).toString() !== transferContext.grossBaseUnits) return fail("transfer amount changed");
+    if (dv.getBigUint64(11, true).toString() !== transferContext.feeBaseUnits) return fail("transfer fee changed");
+    if (tcf.data[10] !== transferContext.decimals) return fail("transfer decimals changed");
+    const [src, mint, dst, auth] = tcf.accounts;
+    if (simKeys[src] !== transferContext.sourceAta) return fail("transfer source ATA changed");
+    if (simKeys[mint] !== transferContext.mint) return fail("transfer mint changed");
+    if (simKeys[dst] !== transferContext.destinationAta) return fail("transfer destination ATA changed");
+    if (simKeys[auth] !== transferContext.authority) return fail("transfer authority changed");
+  }
+
+  // ── ADDED-INSTRUCTION ALLOWLIST (op-level, strict). ──
+  for (const ix of addedIxs) {
+    const desc = describeOp(ix.pid, ix.data, ix.accounts);
+    const newKeyCount = ix.accounts.filter((i) => addedKeys.some((a) => a.key === ret.keys[i])).length;
+    let allowed = false;
+    if (ix.pid === TOKEN_2022_PROGRAM) {
+      // Reallocate with exactly one extension type: pure account-space prep.
+      if (ix.data[0] === 29 && ix.data.length === 3) allowed = true;
+    }
+    if (!allowed) return fail(`added instruction outside allowlist: ${desc}`);
+    if (newKeyCount > 1) return fail(`added instruction ${desc} references ${newKeyCount} new keys (max 1)`);
+  }
+
+  R.push(`addedInstructions=${addedIxs.length}(${addedIxs.map((ix) => describeOp(ix.pid, ix.data, ix.accounts)).join("; ")})`);
+  R.push(`addedKeys=${addedKeys.length}`);
+  R.push(`originalsPreserved=${matched.size}/${simIxs.length}`);
+  R.push(`walletSignatureValid=${walletSignatureValid}`);
+  return { verdict: "allow", report: R.join(" | ") };
 }

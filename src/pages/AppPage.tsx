@@ -597,7 +597,22 @@ export default function AppPage() {
       // method is signTransaction: the wallet returns the signed transaction,
       // proving it signed, and ReynaLens broadcasts exactly once itself.
       setBusyLine("Waiting for wallet signature…");
-      const signedTx = await signWithWallet(tx, { publicKey: owner, signTransaction }, msgBytes);
+      const signResult = await signWithWallet(tx, { publicKey: owner, signTransaction }, msgBytes, {
+        sourceAta: sourceAta!.toBase58(),
+        mint: mintPubkey.toBase58(),
+        destinationAta: destinationAta.toBase58(),
+        authority: owner.toBase58(),
+        grossBaseUnits: effective.gross.toString(),
+        decimals: fresh.decimals,
+        feeBaseUnits: effective.fee.toString(),
+      });
+      const signedTx = signResult.tx;
+      if (signResult.acceptedVia === "phantom_allowlist") {
+        // Transparent one-line disclosure of exactly what the wallet added.
+        toast.info("Wallet prepared the transfer", {
+          description: signResult.mutationReport,
+        });
+      }
 
       // Single-use guard, acquired at the last moment before broadcasting.
       // A duplicate callback or remount that raced us is discarded here —
