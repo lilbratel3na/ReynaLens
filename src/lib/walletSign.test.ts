@@ -10,9 +10,13 @@ import { ed25519 } from "@noble/curves/ed25519";
 import {
   broadcastSignedTransaction,
   createSubmissionGuard,
+  classifyWalletReturn,
   describeSignFailure,
   extractSigningWalletSource,
+  formatWalletReturnDiagnostic,
+  getLastWalletReturnDiagnostic,
   proveSignedTransaction,
+  resetWalletReturnDiagnostic,
   signWithWallet,
   normalizeSignedTransactionReturn,
 } from "./walletSign";
@@ -258,8 +262,11 @@ describe("normalizeSignedTransactionReturn (Phantom Android return shapes)", () 
     const out = normalizeSignedTransactionReturn(signedVersionedBytes());
     expect(out).not.toBeNull();
     expect(out!.kind).toBe("versioned");
-    expect((out!.tx as VersionedTransaction).version).toBe(0);
-    expect((out!.tx as VersionedTransaction).signatures[0].every((b) => b !== 0)).toBe(true);
+    const vtx = out!.tx as VersionedTransaction;
+    expect(vtx.version).toBe(0);
+    // Signature slot must be a present 64-byte signature (zero-filled = unsigned).
+    expect(vtx.signatures[0].length).toBe(64);
+    expect(vtx.signatures[0].some((b) => b !== 0)).toBe(true);
   });
 
   it("case B: Buffer and ArrayBuffer byte carriers → same result as Uint8Array", () => {
@@ -352,13 +359,13 @@ describe("normalizeSignedTransactionReturn (Phantom Android return shapes)", () 
     });
   });
 
-  it("signWithWallet: malformed bytes return → typed failure, never broadcasts", async () => {
+  it("signWithWallet: malformed bytes return → typed no_signature_returned, never broadcasts", async () => {
     const wallet = {
       publicKey: { toBase58: () => payer.publicKey.toBase58() },
       signTransaction: async () => new Uint8Array([1, 2, 3]) as unknown as Transaction,
     };
     await expect(signWithWallet(buildLegacyTx(), wallet, new Uint8Array([1]))).rejects.toMatchObject({
-      reason: "bridge_failure",
+      reason: "no_signature_returned",
     });
   });
 
@@ -372,6 +379,163 @@ describe("normalizeSignedTransactionReturn (Phantom Android return shapes)", () 
     const expected =
       normE.tx instanceof Transaction ? normE.tx.serializeMessage() : normE.tx.message.serialize();
     const signed = await signWithWallet(buildLegacyTx(), wallet, new Uint8Array(expected));
+    expect(signed).toBeTruthy();
+  });
+});
+
+describe("classifyWalletReturn (safe structural diagnostic, attempt #4)", () => {
+  const base = { typeofValue: "object", constructorName: expect.any(String) };
+
+  it("classifies null/undefined/primitives with type info only", () => {
+    for (const v of [null, undefined]) {
+      const d = classifyWalletReturn(v);
+      expect(d.typeofValue).toBe(typeof v); // "object" for null, "undefined" for undefined
+      expect(d.constructorName).toBeNull();
+      expect(d.hasSerialize).toBe(false);
+      expect(d.safeOwnKeys).toEqual([]);
+    }
+    const p = classifyWalletReturn(42);
+    expect(p.typeofValue).toBe("number");
+    expect(p.isArray).toBe(false);
+  });
+
+  it("classifies Uint8Array payload with byteLength only (never content)", () => {
+    const d = classifyWalletReturn(new Uint8Array([1, 2, 3, 4, 5]));
+    expect(d.isUint8Array).toBe(true);
+    expect(d.byteLength).toBe(5);
+    expect(d.hasSerialize).toBe(false);
+    expect(JSON.stringify(d)).not.toContain("1,2,3");
+  });
+
+  it("classifies ArrayBuffer payload with byteLength only", () => {
+    const d = classifyWalletReturn(new ArrayBuffer(9));
+    expect(d.isArrayBuffer).toBe(true);
+    expect(d.byteLength).toBe(9);
+  });
+
+  it("classifies a Transaction-like object structurally", () => {
+    const fake = {
+      serialize: () => new Uint8Array(),
+      signature: null,
+      signatures: [],
+    };
+    const d = classifyWalletReturn(fake);
+    expect(d.hasSerialize).toBe(true);
+    expect(d.hasSignatureProp).toBe(true);
+    expect(d.signatureIsNull).toBe(true);
+    expect(d.hasSignaturesProp).toBe(true);
+    expect(d.signaturesIsArray).toBe(true);
+    expect(d.signaturesLength).toBe(0);
+    expect(base).toBeTruthy();
+  });
+
+  it("classifies envelope { signedTransaction } and filters unsafe keys by NAME", () => {
+    const sneaky = {
+      signedTransaction: new Uint8Array(3),
+      secretKey: "DO-NOT-LOG",
+      privateKeyBytes: new Uint8Array([9, 9, 9]),
+      everythingElse: true,
+    };
+    const d = classifyWalletReturn(sneaky);
+    expect(d.hasSignedTransaction).toBe(true);
+    // Only whitelisted key NAMES are reported — never values, never other keys.
+    expect(d.safeOwnKeys).toEqual(["signedTransaction"]);
+    expect(JSON.stringify(d)).not.toContain("DO-NOT-LOG");
+    expect(JSON.stringify(d)).not.toContain("privateKeyBytes");
+  });
+
+  it("signature prop non-null is reported as present (not its value)", () => {
+    const d = classifyWalletReturn({ signature: new Uint8Array(64).fill(1) });
+    expect(d.signatureIsNull).toBe(false);
+  });
+
+  it("format produces the required diagnostic line shape", () => {
+    const line = formatWalletReturnDiagnostic(
+      classifyWalletReturn(new Uint8Array(131)),
+    );
+    expect(line).toContain("type=object");
+    expect(line).toContain("uint8=true");
+    expect(line).toContain("byteLength=131");
+    expect(line).toContain("serialize=false");
+    expect(line).toContain("signatures=absent");
+  });
+
+  it("signWithWallet embeds the diagnostic in no_signature_returned failures", async () => {
+    const payer = Keypair.generate();
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => ({ totally: "unexpected" }) as never,
+    };
+    try {
+      await signWithWallet(new Transaction(), wallet, new Uint8Array([1]));
+      throw new Error("should have thrown");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "";
+      // Unusable post-resolve value (not an object with signable shape) →
+      // no_signature_returned with the safe structural diagnostic embedded.
+      expect((e as { reason?: string }).reason).toBe("no_signature_returned");
+      expect(msg).toContain("Wallet return diagnostic:");
+      expect(msg).toContain("type=object");
+      expect(msg).toContain("serialize=false");
+    }
+  });
+
+  it("signWithWallet embeds the diagnostic in bridge_failure (malformed bytes)", async () => {
+    const payer = Keypair.generate();
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => new Uint8Array([1, 2, 3]) as never,
+    };
+    try {
+      await signWithWallet(new Transaction(), wallet, new Uint8Array([1]));
+      throw new Error("should have thrown");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "";
+      // Post-resolve unusable bytes are classified no_signature_returned;
+      // bridge_failure is reserved for the wallet call itself failing.
+      expect((e as { reason?: string }).reason).toBe("no_signature_returned");
+      expect(msg).toContain("Wallet return diagnostic:");
+      expect(msg).toContain("uint8=true");
+      expect(msg).toContain("byteLength=3");
+    }
+  });
+
+  it("describeSignFailure appends the captured diagnostic (UI path, no AppPage change)", async () => {
+    resetWalletReturnDiagnostic();
+    const payer = Keypair.generate();
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => ({ weird: true }) as never,
+    };
+    await expect(
+      signWithWallet(new Transaction(), wallet, new Uint8Array([1])),
+    ).rejects.toMatchObject({ reason: "no_signature_returned" });
+    // The attempt captured a shape; the UI's reason-only call now shows it.
+    expect(getLastWalletReturnDiagnostic()).toContain("type=object");
+    const text = describeSignFailure("no_signature_returned");
+    expect(text).toContain("Wallet return diagnostic:");
+    expect(text).toContain("type=object");
+    resetWalletReturnDiagnostic();
+    // With no attempt captured, describeSignFailure returns the base text only.
+    expect(describeSignFailure("no_signature_returned")).not.toContain("Wallet return diagnostic:");
+  });
+
+  it("successful proven path does NOT carry diagnostic text", async () => {
+    const payer = Keypair.generate();
+    const to = Keypair.generate().publicKey;
+    const tx = new Transaction().add(
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: to, lamports: 1 }),
+    );
+    tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
+    tx.feePayer = payer.publicKey;
+    const msgBytes = tx.compileMessage().serialize();
+    tx.sign(payer);
+    const bytes = tx.serialize();
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => bytes as unknown as Transaction,
+    };
+    const signed = await signWithWallet(tx, wallet, new Uint8Array(msgBytes));
     expect(signed).toBeTruthy();
   });
 });

@@ -143,22 +143,149 @@ export async function broadcastSignedTransaction(
   });
 }
 
+/**
+ * TEMPORARY P0 DIAGNOSTIC (attempt #4) — safe structural metadata ONLY.
+ *
+ * Real-device attempts #2 and #3 both resolved without rejection yet failed
+ * our proof, so the actual runtime return shape is still unknown. This
+ * classifier captures non-sensitive structure (types, constructor name,
+ * presence of serialize/signature/signatures/signedTransaction, array-ness,
+ * signature count, byte LENGTH of binary payloads, whitelisted own-key
+ * NAMES) and never: key material, message bytes, transaction contents, or
+ * any serialized payload. It runs BEFORE normalization and BEFORE the proof,
+ * and never alters validation, the guard, or the broadcast path.
+ */
+export interface WalletReturnDiagnostic {
+  typeofValue: string;
+  constructorName: string | null;
+  isArray: boolean;
+  isUint8Array: boolean;
+  isArrayBuffer: boolean;
+  hasSerialize: boolean;
+  hasSignatureProp: boolean;
+  /** null = prop absent; true = signature === null; false = non-null. */
+  signatureIsNull: boolean | null;
+  hasSignaturesProp: boolean;
+  signaturesIsArray: boolean;
+  signaturesLength: number | null;
+  hasSignedTransaction: boolean;
+  /** Binary payloads only — length, never content. */
+  byteLength: number | null;
+  /** Own property NAMES filtered to this safe structural whitelist. */
+  safeOwnKeys: string[];
+}
+
+/** Only these own-key NAMES may be reported — never values. */
+const SAFE_OWN_KEYS = new Set([
+  "signature",
+  "signatures",
+  "signedTransaction",
+  "transaction",
+  "rawTransaction",
+  "serialize",
+  "version",
+  "message",
+  "publicKey",
+  "type",
+  "byteLength",
+  "length",
+]);
+
+export function classifyWalletReturn(value: unknown): WalletReturnDiagnostic {
+  const d: WalletReturnDiagnostic = {
+    typeofValue: typeof value,
+    constructorName: null,
+    isArray: false,
+    isUint8Array: false,
+    isArrayBuffer: false,
+    hasSerialize: false,
+    hasSignatureProp: false,
+    signatureIsNull: null,
+    hasSignaturesProp: false,
+    signaturesIsArray: false,
+    signaturesLength: null,
+    hasSignedTransaction: false,
+    byteLength: null,
+    safeOwnKeys: [],
+  };
+  if (value === null || value === undefined) return d;
+  d.constructorName =
+    (value as { constructor?: { name?: string } }).constructor?.name ?? null;
+  if (typeof value !== "object") return d; // primitives: type info only
+  const obj = value as Record<string, unknown>;
+  d.isArray = Array.isArray(value);
+  d.isUint8Array = value instanceof Uint8Array;
+  d.isArrayBuffer = value instanceof ArrayBuffer;
+  if (value instanceof Uint8Array) d.byteLength = value.byteLength;
+  else if (value instanceof ArrayBuffer) d.byteLength = value.byteLength;
+  d.hasSerialize = typeof obj.serialize === "function";
+  d.hasSignatureProp = "signature" in obj;
+  if (d.hasSignatureProp) d.signatureIsNull = obj.signature === null;
+  d.hasSignaturesProp = "signatures" in obj;
+  d.signaturesIsArray = Array.isArray(obj.signatures);
+  if (d.signaturesIsArray) d.signaturesLength = (obj.signatures as unknown[]).length;
+  d.hasSignedTransaction = "signedTransaction" in obj;
+  d.safeOwnKeys = Object.getOwnPropertyNames(obj)
+    .filter((k) => SAFE_OWN_KEYS.has(k))
+    .slice(0, 12);
+  return d;
+}
+
+/** One-line, value-free structural summary for the UI failure message. */
+export function formatWalletReturnDiagnostic(d: WalletReturnDiagnostic): string {
+  const parts = [
+    `type=${d.typeofValue}`,
+    `constructor=${d.constructorName ?? "n/a"}`,
+    `array=${d.isArray}`,
+    `uint8=${d.isUint8Array}`,
+    `arrayBuffer=${d.isArrayBuffer}`,
+    `serialize=${d.hasSerialize}`,
+    `signature=${d.hasSignatureProp ? (d.signatureIsNull ? "null" : "present") : "absent"}`,
+    `signatures=${d.hasSignaturesProp ? (d.signaturesIsArray ? `array(${d.signaturesLength})` : "non-array") : "absent"}`,
+    `signedTransaction=${d.hasSignedTransaction}`,
+  ];
+  if (d.byteLength !== null) parts.push(`byteLength=${d.byteLength}`);
+  if (d.safeOwnKeys.length > 0) parts.push(`keys=[${d.safeOwnKeys.join(",")}]`);
+  return parts.join(" ");
+}
+
+/** TEMPORARY: the latest attempt's safe structural diagnostic (module-scoped so
+ * describeSignFailure — called by the UI with only the reason — can append it).
+ * Single-user app; signing attempts are strictly sequential. */
+let lastWalletReturnDiagnostic: string | null = null;
+
+/** TEMPORARY: clears the captured diagnostic (used by tests). */
+export function resetWalletReturnDiagnostic(): void {
+  lastWalletReturnDiagnostic = null;
+}
+
+/** TEMPORARY: the captured diagnostic for the latest signing attempt, if any. */
+export function getLastWalletReturnDiagnostic(): string | null {
+  return lastWalletReturnDiagnostic;
+}
+
 /** Readable text for each typed failure, safe to render in the UI. */
 export function describeSignFailure(reason: SignFailureReason): string {
-  switch (reason) {
-    case "rejected":
-      return "The signature request was rejected or dismissed in your wallet. Nothing was signed or submitted.";
-    case "no_signature_returned":
-      return "Your wallet did not return a valid signed transaction. Nothing was signed or submitted.";
-    case "bridge_failure":
-      return "Your wallet closed the signing request without returning a signature. Nothing was signed or submitted.";
-    case "signer_unavailable":
-      return "The connected wallet does not expose a supported signing method for this transaction. Nothing was signed or submitted.";
-    case "blockhash_expired":
-      return "The transaction's blockhash expired before it could be submitted. Nothing was signed or submitted — retrying builds a fresh transaction.";
-    case "broadcast_failed":
-      return "The network rejected the transaction submission.";
-  }
+  const base = (() => {
+    switch (reason) {
+      case "rejected":
+        return "The signature request was rejected or dismissed in your wallet. Nothing was signed or submitted.";
+      case "no_signature_returned":
+        return "Your wallet did not return a valid signed transaction. Nothing was signed or submitted.";
+      case "bridge_failure":
+        return "Your wallet closed the signing request without returning a signature. Nothing was signed or submitted.";
+      case "signer_unavailable":
+        return "The connected wallet does not expose a supported signing method for this transaction. Nothing was signed or submitted.";
+      case "blockhash_expired":
+        return "The transaction's blockhash expired before it could be submitted. Nothing was signed or submitted — retrying builds a fresh transaction.";
+      case "broadcast_failed":
+        return "The network rejected the transaction submission.";
+    }
+  })();
+  // TEMPORARY (attempt #4): append THIS attempt's safe structural diagnostic so
+  // the real return shape becomes observable on device.
+  const diag = lastWalletReturnDiagnostic;
+  return diag ? `${base} Wallet return diagnostic: ${diag}` : base;
 }
 
 export type SignableTransaction = Transaction;
@@ -315,8 +442,30 @@ export async function signWithWallet(
       "This wallet does not expose a supported signing method. Nothing was signed.",
     );
   }
+  // Each attempt starts clean: a later unrelated failure must never display a
+  // stale diagnostic from a previous attempt.
+  lastWalletReturnDiagnostic = null;
+  let returned: unknown;
   try {
-    const returned = await wallet.signTransaction(transaction);
+    returned = await wallet.signTransaction(transaction);
+  } catch (e) {
+    // The wallet call itself failed — there is no return value to diagnose.
+    if (isRejectedSignatureError(e)) {
+      throw makeSignFailure(
+        "rejected",
+        "The signature request was rejected or dismissed in your wallet.",
+      );
+    }
+    throw makeSignFailure("bridge_failure", e instanceof Error ? e.message : String(e));
+  }
+  // The wallet RESOLVED. From here, any unusable value is classified as
+  // no_signature_returned (it returned something — just nothing we can prove).
+  // TEMPORARY P0 diagnostic (attempt #4): capture safe structural metadata
+  // BEFORE normalization and BEFORE the proof. Never logs keys, message
+  // bytes, or serialized content — only shapes, counts, and byte LENGTHS.
+  const diagnostic = formatWalletReturnDiagnostic(classifyWalletReturn(returned));
+  lastWalletReturnDiagnostic = diagnostic; // for describeSignFailure in the UI
+  try {
     // Normalize the wallet's return shape (bytes / envelope / Transaction)
     // BEFORE proving. Grounded in the installed adapter: it delegates the
     // return value verbatim, and the injected provider does not return a
@@ -326,24 +475,25 @@ export async function signWithWallet(
     if (!normalized) {
       throw makeSignFailure(
         "no_signature_returned",
-        "The wallet did not return a signed transaction. Nothing was signed or submitted.",
+        `The wallet did not return a signed transaction. Nothing was signed or submitted. Wallet return diagnostic: ${diagnostic}`,
       );
     }
     if (!proveSignedTransaction(normalized.tx, expectedMessageBytes)) {
       throw makeSignFailure(
         "no_signature_returned",
-        "The wallet did not return a valid signature for the exact transaction that was simulated. Nothing was signed or submitted.",
+        `The wallet did not return a valid signature for the exact transaction that was simulated. Nothing was signed or submitted. Wallet return diagnostic: ${diagnostic}`,
       );
     }
+    // Proven. The diagnostic served its purpose; a later failure in THIS
+    // attempt (e.g. broadcast_failed) must not display a signing-shape note.
+    lastWalletReturnDiagnostic = null;
     return normalized.tx;
   } catch (e) {
     if (e instanceof Error && (e as SignFailure).reason) throw e; // already typed
-    if (isRejectedSignatureError(e)) {
-      throw makeSignFailure(
-        "rejected",
-        "The signature request was rejected or dismissed in your wallet.",
-      );
-    }
-    throw makeSignFailure("bridge_failure", e instanceof Error ? e.message : String(e));
+    // Normalization/parse failure of the resolved value.
+    throw makeSignFailure(
+      "no_signature_returned",
+      `${e instanceof Error ? e.message : String(e)} Wallet return diagnostic: ${diagnostic}`,
+    );
   }
 }
