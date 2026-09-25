@@ -72,19 +72,12 @@ import {
 } from "@/lib/transferIntent";
 import { createSubmissionGuard } from "@/lib/walletSign";
 import {
-  attachSubmitAdapterDiagnostics,
-  attachSubmitLifecycleDiagnostics,
-  currentNavigationType,
-  submitDiag,
-} from "@/lib/solana/submitDiagnostics";
-import {
   describeSubmitFailure,
   submitTransferViaWallet,
   type SubmitFailure,
 } from "@/lib/solana/submitViaWallet";
 import { useWalletConnect } from "@/hooks/use-wallet-connect";
 import { useWallet } from "@solana/wallet-adapter-react";
-import { SubmitDiagnosticsPanel } from "@/pages/SubmitDiagnosticsPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 type Phase = "compose" | "preview" | "receipt";
@@ -117,33 +110,6 @@ export default function AppPage() {
   // never broadcasts itself.
   const { wallet } = useWallet();
   const walletAdapter = wallet?.adapter ?? null;
-
-  // TEMPORARY diagnostic (P0 handoff investigation): passive recording only —
-  // never disconnects, never connects, never alters flow. Records the mount
-  // context (reload/navigation type) so a handoff reload is provable on return.
-  useEffect(() => {
-    submitDiag("mount", { navigationType: currentNavigationType() });
-    const detachLifecycle = attachSubmitLifecycleDiagnostics();
-    return () => {
-      submitDiag("mount:unmount");
-      detachLifecycle();
-    };
-  }, []);
-
-  // TEMPORARY diagnostic: record adapter disconnect/error emissions during the
-  // handoff window. Listening only. The wrapper adapts the adapter's strongly
-  // typed EventEmitter to the recorder's narrow two-event interface.
-  useEffect(() => {
-    if (!walletAdapter) return;
-    return attachSubmitAdapterDiagnostics({
-      on: (event, cb) => {
-        walletAdapter.on(event as never, cb as never);
-      },
-      off: (event, cb) => {
-        walletAdapter.off(event as never, cb as never);
-      },
-    });
-  }, [walletAdapter]);
 
   const recipientRows = useQuery(api.recipients.listRecipients);
   const recordRecipient = useMutation(api.recipients.recordVerifiedRecipient);
@@ -720,12 +686,6 @@ export default function AppPage() {
         });
       }
     } catch (e) {
-      // TEMPORARY diagnostic: proves whether AppPage received the rejection
-      // (vs. the page context dying mid-handoff).
-      submitDiag("app:caught", {
-        name: e instanceof Error ? e.name : null,
-        message: e instanceof Error ? e.message : null,
-      });
       // Typed submission failures (cancellation / wallet error / confirmation /
       // verification) get one friendly sentence each. No structural dumps.
       const submitFail = e as Partial<SubmitFailure> | null;
@@ -790,9 +750,6 @@ export default function AppPage() {
 
   return (
     <main className="min-h-dvh bg-gradient-to-b from-background to-secondary/40">
-      {/* TEMPORARY developer-only debug panel (P0 handoff investigation).
-          Outside the transfer flow; remove once diagnosed. */}
-      <SubmitDiagnosticsPanel />
       <div className="mx-auto flex min-h-dvh w-full max-w-md flex-col px-4 pb-10">
         <header className="flex items-center justify-between gap-3 py-4">
           <div className="min-w-0">
