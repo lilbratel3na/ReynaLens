@@ -24,12 +24,6 @@ function Nav() {
           <ScanLine className="size-5 text-primary" />
           <span className="text-sm font-semibold tracking-tight">REYNALENS</span>
         </a>
-        <Button asChild size="sm" className="cursor-pointer rounded-full">
-          <a href="/app">
-            Open app
-            <ArrowRight className="size-3.5" />
-          </a>
-        </Button>
       </div>
     </header>
   );
@@ -257,9 +251,9 @@ export default function Landing() {
                   against your requested amount. The receipt shows what truly arrived.
                 </p>
                 <div className="mt-6">
-                  <Button asChild className="cursor-pointer">
-                    <a href="/app">
-                      Try ReynaLens <ArrowRight className="size-4" />
+                  <Button asChild variant="outline" className="cursor-pointer">
+                    <a href="#how">
+                      See how it works <ArrowRight className="size-4" />
                     </a>
                   </Button>
                 </div>

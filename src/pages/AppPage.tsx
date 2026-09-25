@@ -114,6 +114,9 @@ export default function AppPage() {
   const recipientRows = useQuery(api.recipients.listRecipients);
   const recordRecipient = useMutation(api.recipients.recordVerifiedRecipient);
   const saveReceiptMut = useMutation(api.recipients.saveReceipt);
+  // Surface persisted receipts: the verified result of the latest completed
+  // transfer is already stored in Convex; this query makes it retrievable.
+  const lastReceipt = useQuery(api.recipients.listReceipts)?.[0] ?? null;
 
   const [phase, setPhase] = useState<Phase>("compose");
   const [asset, setAsset] = useState<PreStockAsset | null>(null);
@@ -804,6 +807,7 @@ export default function AppPage() {
                 shieldLoading={shieldLoading}
                 canPreview={canPreview}
                 onPreview={runShieldThenPreview}
+                lastReceipt={lastReceipt}
               />
             )}
 
@@ -974,6 +978,7 @@ function ComposePhase({
   shieldLoading,
   canPreview,
   onPreview,
+  lastReceipt,
 }: {
   asset: PreStockAsset | null;
   inspecting: boolean;
@@ -998,12 +1003,53 @@ function ComposePhase({
   shieldLoading: boolean;
   canPreview: boolean;
   onPreview: () => void;
+  lastReceipt: {
+    assetSymbol: string;
+    mintDecimals: number;
+    recipient: string;
+    netBaseUnits: string;
+    signature: string;
+    verified: boolean;
+  } | null;
 }) {
   const decimals = mintInspection?.decimals ?? 9;
   const ticker = asset?.ticker ?? "";
 
   return (
     <div className="space-y-4">
+      {/* Latest persisted, verified transfer — the receipt outlives the session
+          and is surfaced here, before any new work begins. */}
+      {lastReceipt && (
+        <Card>
+          <div className="flex items-center justify-between gap-2">
+            <SectionLabel>Last verified transfer</SectionLabel>
+            <a
+              href={explorerTxUrl(lastReceipt.signature)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
+            >
+              View receipt <ExternalLink className="size-3" />
+            </a>
+          </div>
+          <div className="mt-2 space-y-2">
+            <Row
+              k="Recipient received"
+              v={`${formatBaseUnits(BigInt(lastReceipt.netBaseUnits), lastReceipt.mintDecimals)} ${lastReceipt.assetSymbol}`}
+            />
+            <Row k="Recipient" v={shortenAddress(lastReceipt.recipient, 4)} mono />
+          </div>
+          {lastReceipt.verified ? (
+            <p className="mt-2 flex items-center gap-1.5 text-[11px] text-emerald-600 dark:text-emerald-400">
+              <ShieldCheck className="size-3.5 shrink-0" /> Delivery verified on-chain
+            </p>
+          ) : (
+            <p className="mt-2 text-[11px] text-muted-foreground">
+              On-chain delta differed from the request — review on Solana Explorer.
+            </p>
+          )}
+        </Card>
+      )}
       <Card>
         <SectionLabel>Asset</SectionLabel>
         <div className="mt-2 flex flex-wrap gap-2">
