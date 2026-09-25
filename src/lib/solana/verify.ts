@@ -4,7 +4,7 @@ import {
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import { PublicKey } from "@solana/web3.js";
-import type { Connection, ConfirmedTransactionMeta, TransactionResponseMeta } from "@solana/web3.js";
+import type { Connection, ParsedConfirmedTransactionMeta } from "@solana/web3.js";
 
 /** Derive the recipient's Token-2022 associated token account. */
 export function deriveRecipientAta(
@@ -41,7 +41,7 @@ export interface DeliveryVerification {
   explorerUrl: string;
 }
 
-type TxMeta = ConfirmedTransactionMeta | TransactionResponseMeta;
+type TxMeta = ParsedConfirmedTransactionMeta;
 
 function readAccountKeys(meta: TxMeta | null): PublicKey[] {
   if (!meta) return [];
