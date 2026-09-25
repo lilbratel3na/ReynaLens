@@ -60,7 +60,7 @@ export default function Landing() {
                 </a>
               </Button>
               <Button asChild variant="outline" size="lg" className="w-full cursor-pointer sm:w-auto">
-                <a href="#how">See how it works</a>
+                <a href="#workflow">See how it works</a>
               </Button>
             </div>
           </motion.div>
@@ -97,7 +97,7 @@ export default function Landing() {
         </section>
 
         {/* How it works */}
-        <section id="how" className="border-t border-border bg-secondary/40">
+        <section id="workflow" className="border-t border-border bg-secondary/40">
           <div className="mx-auto max-w-5xl px-4 py-16">
             <motion.h2
               {...fadeUp}
@@ -252,7 +252,7 @@ export default function Landing() {
                 </p>
                 <div className="mt-6">
                   <Button asChild variant="outline" className="cursor-pointer">
-                    <a href="#how">
+                    <a href="#workflow">
                       See how it works <ArrowRight className="size-4" />
                     </a>
                   </Button>
