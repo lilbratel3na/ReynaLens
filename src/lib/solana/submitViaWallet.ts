@@ -17,6 +17,7 @@
  */
 
 import type { Connection, Transaction, TransactionSignature } from "@solana/web3.js";
+import { submitDiag } from "./submitDiagnostics";
 
 /** Maps wallet/provider errors onto user-facing failure kinds. */
 export type SubmitFailureKind =
@@ -86,7 +87,7 @@ export async function submitTransferViaWallet(args: {
   wallet: SubmittingWallet;
   connection: Connection;
   transaction: Transaction;
-  guard: { acquire(): boolean };
+  guard: { acquire(): boolean; consumed?: boolean };
   persistSignature: (signature: string) => void;
   confirm: (
     connection: Connection,
@@ -101,6 +102,9 @@ export async function submitTransferViaWallet(args: {
 }): Promise<SubmitOutcome> {
   const { wallet, connection, transaction, guard, persistSignature, confirm, verifyReceipt, onStage } = args;
 
+  // TEMPORARY diagnostic: submit start (before the guard is consumed).
+  submitDiag("submit:start", { guardConsumed: guard.consumed ?? false });
+
   // 1. Single-use duplicate-submission guard.
   if (!guard.acquire()) {
     throw makeSubmitFailure(
@@ -112,8 +116,19 @@ export async function submitTransferViaWallet(args: {
   // 2. The wallet's normal send API with OUR simulated transaction.
   let signature: string;
   try {
+    submitDiag("sendTransaction:called", {
+      txIsLegacy: (transaction as { version?: unknown }).version === undefined,
+      feePayerSet: !!transaction.feePayer,
+      recentBlockhashSet: !!transaction.recentBlockhash,
+      instructionCount: transaction.instructions.length,
+    });
     signature = await wallet.sendTransaction(transaction, connection);
+    submitDiag("sendTransaction:resolved", { signature });
   } catch (e) {
+    submitDiag("sendTransaction:rejected", {
+      name: e instanceof Error ? e.name : null,
+      message: e instanceof Error ? e.message : String(e),
+    });
     if (isWalletCancellation(e)) {
       throw makeSubmitFailure("cancelled", describeSubmitFailure("cancelled"));
     }
@@ -121,6 +136,7 @@ export async function submitTransferViaWallet(args: {
     throw makeSubmitFailure("wallet_error", `The wallet could not complete the transaction. ${msg}`);
   }
   if (typeof signature !== "string" || signature.length === 0) {
+    submitDiag("sendTransaction:empty-signature");
     throw makeSubmitFailure("wallet_error", "The wallet did not return a transaction signature.");
   }
 
@@ -128,30 +144,51 @@ export async function submitTransferViaWallet(args: {
   // signature and never submits again.
   persistSignature(signature);
   onStage?.("submitted");
+  submitDiag("submit:persisted", { signature });
 
-  // 4. Confirm THAT exact signature.
-  const confirmation = await confirm(connection, signature);
-  if (!confirmation.ok) {
-    throw makeSubmitFailure(
-      "confirmation_failed",
-      confirmation.error ?? describeSubmitFailure("confirmation_failed"),
-    );
-  }
-
-  // 5. Verify the actual on-chain receipt strictly (the verifier decides what
-  // "matches" means; no fake success merely because confirmation returned).
-  onStage?.("verifying");
   try {
-    const delivery = await verifyReceipt({ connection, signature });
-    if (!delivery.matchesRequested) {
-      throw makeSubmitFailure("verification_failed", describeSubmitFailure("verification_failed"));
+    // 4. Confirm THAT exact signature.
+    const confirmation = await confirm(connection, signature);
+    if (!confirmation.ok) {
+      submitDiag("confirm:failed", { error: confirmation.error ?? null });
+      throw makeSubmitFailure(
+        "confirmation_failed",
+        confirmation.error ?? describeSubmitFailure("confirmation_failed"),
+      );
     }
-    return { signature, slot: confirmation.slot, delivery };
+
+    // 5. Verify the actual on-chain receipt strictly (the verifier decides what
+    // "matches" means; no fake success merely because confirmation returned).
+    onStage?.("verifying");
+    try {
+      const delivery = await verifyReceipt({ connection, signature });
+      if (!delivery.matchesRequested) {
+        submitDiag("receipt:mismatch", {
+          actuallyReceived: delivery.actuallyReceived?.toString() ?? null,
+        });
+        throw makeSubmitFailure("verification_failed", describeSubmitFailure("verification_failed"));
+      }
+      submitDiag("receipt:verified", { signature });
+      return { signature, slot: confirmation.slot, delivery };
+    } catch (e) {
+      if ((e as Partial<SubmitFailure>).kind === "verification_failed") throw e;
+      submitDiag("receipt:verify-threw", {
+        name: e instanceof Error ? e.name : null,
+        message: e instanceof Error ? e.message : null,
+      });
+      throw makeSubmitFailure(
+        "verification_failed",
+        e instanceof Error ? e.message : describeSubmitFailure("verification_failed"),
+      );
+    }
   } catch (e) {
-    if ((e as Partial<SubmitFailure>).kind === "verification_failed") throw e;
-    throw makeSubmitFailure(
-      "verification_failed",
-      e instanceof Error ? e.message : describeSubmitFailure("verification_failed"),
-    );
+    // TEMPORARY diagnostic: the submit-pipeline terminal error (already typed).
+    submitDiag("submit:caught", {
+      kind: (e as Partial<SubmitFailure>).kind ?? null,
+      message: e instanceof Error ? e.message : null,
+    });
+    throw e;
+  } finally {
+    submitDiag("submit:finally");
   }
 }
