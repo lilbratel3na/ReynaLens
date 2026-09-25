@@ -3,7 +3,8 @@ import {
   getAccount,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
-import type { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
+import type { Connection, ConfirmedTransactionMeta, TransactionResponseMeta } from "@solana/web3.js";
 
 /** Derive the recipient's Token-2022 associated token account. */
 export function deriveRecipientAta(
@@ -22,6 +23,14 @@ export interface DeliveryVerification {
   signature: string;
   slot: number | null;
   confirmationStatus: string | null;
+  /** True when the transaction exists on chain and carried no error. */
+  transactionSucceeded: boolean;
+  /** Mint of the verified destination token account (when checked). */
+  mint?: string;
+  /** Owner of the verified destination token account (when checked). */
+  recipientOwner?: string;
+  /** Destination ATA actually verified (when checked). */
+  destinationAta?: string;
   /** Balance read from chain after the transfer. */
   postBalanceBaseUnits: bigint;
   /** Balance read before the transfer (0 for brand-new accounts). */
@@ -32,29 +41,108 @@ export interface DeliveryVerification {
   explorerUrl: string;
 }
 
+type TxMeta = ConfirmedTransactionMeta | TransactionResponseMeta;
+
+function readAccountKeys(meta: TxMeta | null): PublicKey[] {
+  if (!meta) return [];
+  const loaded = "loadedAddresses" in meta ? meta.loadedAddresses : undefined;
+  return [
+    ...((loaded?.writable ?? []) as PublicKey[]),
+    ...((loaded?.readonly ?? []) as PublicKey[]),
+  ];
+}
+
 /**
- * Post-transfer verification: read the destination token account and prove the
- * actual delta equals the requested net amount.
+ * Post-transfer verification — STRICT. No fake success merely because a
+ * confirmation returned. Proves, from the actual confirmed transaction and
+ * the live chain state:
+ *   - the transaction succeeded on chain (meta.err null) and was signed by
+ *     the expected fee payer,
+ *   - the destination token account is the EXACT intended ATA,
+ *   - its mint is the EXACT intended mint,
+ *   - its owner is the EXACT intended recipient,
+ *   - the balance delta equals the EXACT requested net amount.
  */
 export async function verifyDelivery(args: {
   connection: Connection;
   destinationAta: PublicKey;
-  preBalanceBaseUnits: bigint;
+  /** Balance observed before the transfer (0 for a brand-new account). */
+  preBalanceLiveRead: bigint;
   requestedNet: bigint;
+  requestedMint: PublicKey;
+  requestedRecipientOwner: PublicKey;
+  /** Our wallet — proves the confirmed transaction is OURS, not a lookalike. */
+  expectedFeePayer: PublicKey;
   signature: string;
 }): Promise<DeliveryVerification> {
   const {
     connection,
     destinationAta,
-    preBalanceBaseUnits,
+    preBalanceLiveRead: preBalanceBaseUnits,
     requestedNet,
+    requestedMint,
+    requestedRecipientOwner,
+    expectedFeePayer,
     signature,
   } = args;
 
+  // ── The exact transaction, with meta (this is what actually happened). ──
+  const txInfo = await connection.getParsedTransaction(signature, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  });
+  if (!txInfo || !txInfo.meta) {
+    throw new Error(
+      "The transaction could not be read on chain. The receipt is unverified.",
+    );
+  }
+  const meta = txInfo.meta;
+  if (meta.err !== null && meta.err !== undefined) {
+    throw new Error(
+      `The transaction failed on chain: ${JSON.stringify(meta.err)}. No delivery verified.`,
+    );
+  }
+
+  // Account keys: static message keys + loaded v0 addresses (meta position).
+  const staticKeys = txInfo.transaction.message.accountKeys.map(
+    (k) => (typeof k === "string" ? new PublicKey(k) : k.pubkey),
+  );
+  const keys = [...staticKeys, ...readAccountKeys(meta)];
+
+  // ── Our fee payer signed THIS transaction (never a lookalike). ──
+  const feePayer = keys[0];
+  if (!feePayer || !feePayer.equals(expectedFeePayer)) {
+    throw new Error(
+      "The confirmed transaction was not sent by this wallet. The receipt is unverified.",
+    );
+  }
+
+  // ── Destination-ATA identity inside the transaction's account list. ──
+  const ataInTx = keys.some((k) => k.equals(destinationAta));
+  if (!ataInTx) {
+    throw new Error(
+      "The confirmed transaction does not touch the intended recipient token account. No delivery verified.",
+    );
+  }
+
+  // ── The live destination account: existence, mint, owner, balance. ──
   const acc = await getAccount(connection, destinationAta, "confirmed", TOKEN_2022_PROGRAM_ID);
   const post = acc.amount;
+  const accMint = acc.mint.toBase58();
+  const accOwner = acc.owner.toBase58();
+  if (accMint !== requestedMint.toBase58()) {
+    throw new Error(
+      "The destination token account holds a different mint than requested. No delivery verified.",
+    );
+  }
+  if (accOwner !== requestedRecipientOwner.toBase58()) {
+    throw new Error(
+      "The destination token account is not owned by the intended recipient. No delivery verified.",
+    );
+  }
 
-  // Also confirm the tx status on chain.
+  // Status (confirmation level + slot) — identity checks above already proved
+  // success via meta.err; this only enriches the receipt.
   const status = await connection.getSignatureStatuses([signature]);
   const st = status.value[0];
 
@@ -62,11 +150,15 @@ export async function verifyDelivery(args: {
     signature,
     slot: st?.slot ?? null,
     confirmationStatus: st?.confirmationStatus ?? null,
+    transactionSucceeded: true,
+    mint: accMint,
+    recipientOwner: accOwner,
+    destinationAta: destinationAta.toBase58(),
     postBalanceBaseUnits: post,
     preBalanceBaseUnits,
     actuallyReceived: post - preBalanceBaseUnits,
     matchesRequested: post - preBalanceBaseUnits === requestedNet,
-    blockTime: null,
+    blockTime: txInfo.blockTime ?? null,
     explorerUrl: `https://solscan.io/tx/${signature}`,
   };
 }

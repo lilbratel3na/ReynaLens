@@ -70,13 +70,12 @@ import {
   saveSubmittedSignature,
   clearSubmittedSignature,
 } from "@/lib/transferIntent";
+import { createSubmissionGuard } from "@/lib/walletSign";
 import {
-  broadcastSignedTransaction,
-  createSubmissionGuard,
-  describeSignFailure,
-  signWithWallet,
-  type SignFailure,
-} from "@/lib/walletSign";
+  describeSubmitFailure,
+  submitTransferViaWallet,
+  type SubmitFailure,
+} from "@/lib/solana/submitViaWallet";
 import { useWalletConnect } from "@/hooks/use-wallet-connect";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -106,7 +105,11 @@ export default function AppPage() {
     disconnectWallet,
   } = useWalletConnect();
 
-  const { signTransaction } = useWallet();
+  // The wallet ADAPTER is the production submission mechanism: its normal
+  // sendTransaction signs AND submits. ReynaLens never signs locally and
+  // never broadcasts itself.
+  const { wallet } = useWallet();
+  const walletAdapter = wallet?.adapter ?? null;
 
   const recipientRows = useQuery(api.recipients.listRecipients);
   const recordRecipient = useMutation(api.recipients.recordVerifiedRecipient);
@@ -402,8 +405,11 @@ export default function AppPage() {
           destinationAta,
           // After a remount the true pre-balance is unknowable; for a fresh
           // recipient account (the normal case) the post balance IS the delta.
-          preBalanceBaseUnits: 0n,
+          preBalanceLiveRead: 0n,
           requestedNet: exactOut.net,
+          requestedMint: mintPubkey,
+          requestedRecipientOwner: recipientPk,
+          expectedFeePayer: owner,
           signature: sig,
         });
         clearSubmittedSignature();
@@ -572,16 +578,14 @@ export default function AppPage() {
         : await readBalanceOrZero(rpc, destinationAta);
 
       setSignPhase("signing");
-      setBusyLine("Preparing signature request…");
-      // Fresh blockhash immediately before signing — the simulated transaction
-      // is never reused stale. Message bytes are captured AFTER pinning: this
-      // is the exact message the wallet is asked to sign, and the proof that
-      // the wallet returned it unmodified.
+      setBusyLine("Preparing the transaction for your wallet…");
+      // Fresh blockhash immediately before submission — the simulated
+      // transaction is never reused stale — and one final simulation of the
+      // EXACT object the wallet will receive.
       const latest = await rpc.getLatestBlockhash("confirmed");
       const tx = built.transaction;
       tx.recentBlockhash = latest.blockhash;
       tx.feePayer = owner;
-      const msgBytes = tx.serializeMessage();
       const resim = await simulateTransfer(rpc, tx, owner);
       if (!resim.ok) {
         const reason = resim.error ?? "Re-simulation of the signing transaction failed.";
@@ -590,91 +594,63 @@ export default function AppPage() {
         toast.error("Transfer blocked", { description: reason });
         return;
       }
-
-      // ── SIGN ONLY (never sign-and-send) ──
-      // Mobile Phantom's signAndSend bridge drops the response after Confirm
-      // (diagnosed root cause of the silent failure). The supported, reliable
-      // method is signTransaction: the wallet returns the signed transaction,
-      // proving it signed, and ReynaLens broadcasts exactly once itself.
-      setBusyLine("Waiting for wallet signature…");
-      const signResult = await signWithWallet(tx, { publicKey: owner, signTransaction }, msgBytes, {
-        sourceAta: sourceAta!.toBase58(),
-        mint: mintPubkey.toBase58(),
-        destinationAta: destinationAta.toBase58(),
-        authority: owner.toBase58(),
-        grossBaseUnits: effective.gross.toString(),
-        decimals: fresh.decimals,
-        feeBaseUnits: effective.fee.toString(),
-      });
-      const signedTx = signResult.tx;
-      if (signResult.acceptedVia === "phantom_allowlist") {
-        // Transparent one-line disclosure of exactly what the wallet added.
-        toast.info("Wallet prepared the transfer", {
-          description: signResult.mutationReport,
-        });
-      }
-
-      // Single-use guard, acquired at the last moment before broadcasting.
-      // A duplicate callback or remount that raced us is discarded here —
-      // never broadcast twice.
-      if (!submissionGuardRef.current.acquire()) {
+      if (!walletAdapter) {
         setSignPhase("failed");
-        setSimError(
-          "A transaction from this session was already submitted. Start a new transfer to sign again.",
-        );
-        return;
-      }
-      setBusyLine("Submitting transaction…");
-      let sig: string;
-      try {
-        sig = await broadcastSignedTransaction(rpc, signedTx);
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        setSignPhase("failed");
-        setSimError(`Submission failed: ${friendlyRpcError(reason)}`);
-        toast.error("Submission failed", { description: friendlyRpcError(reason) });
-        return;
-      }
-      // Persist BEFORE polling: a crash/remount continues confirming THIS
-      // signature and never submits again.
-      saveSubmittedSignature(sig);
-
-      setSignPhase("submitted");
-      setBusyLine("Confirming on Solana…");
-      // Confirm the exact submitted signature. If the first window expires but
-      // the blockhash is still valid, keep polling the SAME signature — never
-      // rebuild or re-send automatically.
-      let confirmation = await confirmSignature(rpc, sig);
-      if (!confirmation.ok) {
-        let currentHeight: number | null = null;
-        try {
-          currentHeight = await rpc.getBlockHeight("confirmed");
-        } catch {
-          currentHeight = null;
-        }
-        const expired = currentHeight !== null && currentHeight > latest.lastValidBlockHeight;
-        if (!expired) {
-          confirmation = await confirmSignature(rpc, sig, 120_000);
-        }
-      }
-      if (!confirmation.ok) {
-        const reason =
-          confirmation.error ??
-          "The transaction did not confirm in time. Check the explorer before retrying — do not double-send.";
-        toast.error("Confirmation not verified", { description: reason });
-        setSimError(reason);
-        setSignPhase("failed");
+        setSimError("No wallet is connected. Connect a wallet and try again — nothing was sent.");
         return;
       }
 
-      setBusyLine("Verifying actual delivery…");
-      const proof = await verifyDelivery({
+      // ── PRODUCTION SUBMISSION (wallet-adapter sendTransaction) ──
+      // The wallet's normal send-and-confirm API is the single submission
+      // mechanism. The transaction handed over is the exact object built and
+      // simulated above. The wallet signs AND submits; ReynaLens never signs
+      // locally, never inspects a wallet-modified transaction, and never
+      // broadcasts itself.
+      setBusyLine("Waiting for your wallet…");
+      const outcome = await submitTransferViaWallet({
+        wallet: walletAdapter,
         connection: rpc,
-        destinationAta,
-        preBalanceBaseUnits: preDestinationBalance,
-        requestedNet: effective.net,
-        signature: sig,
+        transaction: tx,
+        guard: submissionGuardRef.current,
+        persistSignature: saveSubmittedSignature,
+        confirm: async (connection, sig) => {
+          const first = await confirmSignature(connection, sig);
+          if (first.ok) return first;
+          // If the first window expired but the blockhash is still valid, keep
+          // polling the SAME signature — never rebuild or re-send.
+          let currentHeight: number | null = null;
+          try {
+            currentHeight = await connection.getBlockHeight("confirmed");
+          } catch {
+            currentHeight = null;
+          }
+          if (currentHeight === null || currentHeight <= latest.lastValidBlockHeight) {
+            return confirmSignature(connection, sig, 120_000);
+          }
+          return first;
+        },
+        onStage: (stage) => {
+          if (stage === "submitted") {
+            setSignPhase("submitted");
+            setBusyLine("Confirming on Solana…");
+          } else {
+            setBusyLine("Verifying actual delivery…");
+          }
+        },
+        verifyReceipt: ({ connection, signature }) =>
+          verifyDelivery({
+            connection,
+            destinationAta,
+            preBalanceLiveRead: preDestinationBalance,
+            requestedNet: effective.net,
+            requestedMint: mintPubkey,
+            requestedRecipientOwner: recipientPk,
+            expectedFeePayer: owner,
+            signature,
+          }),
       });
+      const { signature: sig, delivery: proof } = outcome;
+
       setSignPhase("confirmed");
       setVerification(proof);
       setFinalExactOut(effective);
@@ -710,21 +686,18 @@ export default function AppPage() {
         });
       }
     } catch (e) {
-      // Typed signing failures (rejection / bridge drop / no signature /
-      // no signer) get their precise, user-safe description; RPC-level
-      // staleness is called out explicitly. Nothing here auto-retries.
-      const signFail = e as Partial<SignFailure> | null;
+      // Typed submission failures (cancellation / wallet error / confirmation /
+      // verification) get one friendly sentence each. No structural dumps.
+      const submitFail = e as Partial<SubmitFailure> | null;
       const msg = e instanceof Error ? e.message : String(e);
-      let friendly: string;
-      if (signFail && typeof signFail === "object" && "reason" in signFail && signFail.reason) {
-        friendly = describeSignFailure(signFail.reason);
-      } else if (/rejected|denied|declined|dismissed/i.test(msg)) {
-        friendly = "You rejected the transaction in your wallet. Nothing was sent.";
-      } else if (/blockhash not found|block height exceeded|expired/i.test(msg)) {
-        friendly = describeSignFailure("blockhash_expired");
-      } else {
-        friendly = friendlyRpcError(msg);
-      }
+      const kind = submitFail && typeof submitFail === "object" && "kind" in submitFail ? submitFail.kind : null;
+      const friendly = kind
+        ? msg // SubmitFailure messages are already the user-facing sentence
+        : /rejected|denied|declined|dismissed|cancel/i.test(msg)
+          ? "Wallet cancelled"
+          : /blockhash not found|block height exceeded|expired/i.test(msg)
+            ? "The transaction expired before it could be submitted. Start the transfer again."
+            : friendlyRpcError(msg);
       setSimError(friendly);
       setSignPhase("failed");
       toast.error("Transfer failed", { description: friendly });
@@ -734,7 +707,7 @@ export default function AppPage() {
     }
   }, [
     owner, asset, mintInspection, mintPubkey, exactOut, shieldVerdict,
-    knownRecipients, sourceAta, recipientInput, signTransaction, recordRecipient,
+    knownRecipients, sourceAta, recipientInput, walletAdapter, recordRecipient,
     saveReceiptMut,
   ]);
 
