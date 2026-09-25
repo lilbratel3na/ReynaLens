@@ -84,6 +84,7 @@ import {
 } from "@/lib/solana/submitViaWallet";
 import { useWalletConnect } from "@/hooks/use-wallet-connect";
 import { useWallet } from "@solana/wallet-adapter-react";
+import { SubmitDiagnosticsPanel } from "@/pages/SubmitDiagnosticsPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 type Phase = "compose" | "preview" | "receipt";
@@ -789,6 +790,9 @@ export default function AppPage() {
 
   return (
     <main className="min-h-dvh bg-gradient-to-b from-background to-secondary/40">
+      {/* TEMPORARY developer-only debug panel (P0 handoff investigation).
+          Outside the transfer flow; remove once diagnosed. */}
+      <SubmitDiagnosticsPanel />
       <div className="mx-auto flex min-h-dvh w-full max-w-md flex-col px-4 pb-10">
         <header className="flex items-center justify-between gap-3 py-4">
           <div className="min-w-0">
