@@ -420,10 +420,16 @@ let lastWalletReturnDiagnostic: string | null = null;
 /** TEMPORARY: safe proof-stage diagnostic (same module-scoped pattern). */
 let lastProofDiagnostic: string | null = null;
 
+/** TEMPORARY: the latest attempt's serialized wire bytes (PUBLIC data the
+ * wallet's own code produced). Captured as soon as the return is usable so a
+ * REJECT still ships the exact payload for offline decoding. */
+let lastWireBase58: string | null = null;
+
 /** TEMPORARY: clears captured diagnostics (used by tests). */
 export function resetWalletReturnDiagnostic(): void {
   lastWalletReturnDiagnostic = null;
   lastProofDiagnostic = null;
+  lastWireBase58 = null;
 }
 
 /** TEMPORARY: the captured wallet-return diagnostic for the latest attempt. */
@@ -459,6 +465,8 @@ export function describeSignFailure(reason: SignFailureReason): string {
   const parts = [base];
   if (lastWalletReturnDiagnostic) parts.push(`Wallet return diagnostic: ${lastWalletReturnDiagnostic}`);
   if (lastProofDiagnostic) parts.push(`Proof diagnostic: ${lastProofDiagnostic}`);
+  // LAST: the wire string sits at the end of the line, trivial to copy.
+  if (lastWireBase58) parts.push(`wire=${lastWireBase58}`);
   return parts.join(" ");
 }
 
@@ -620,6 +628,25 @@ export interface SignWithWalletResult {
   wireBase58?: string;
 }
 
+/**
+ * Serialized wire bytes of the wallet's return (public data the wallet's own
+ * code produced). Try/catch: a structural SignedLike with a fake serializer
+ * must not turn a REJECT into an unrelated crash — the reject then simply
+ * ships without wire bytes.
+ */
+function safeWireBase58(tx: Transaction | VersionedTransaction | SignedLike): string | null {
+  try {
+    return bs58.encode(tx.serialize());
+  } catch {
+    return null;
+  }
+}
+
+/** Uniform suffix so REJECT failures carry the captured wire for offline analysis. */
+function wireSuffix(wire: string | null): string {
+  return wire ? ` wire=${wire}` : "";
+}
+
 export async function signWithWallet(
   transaction: Transaction,
   wallet: {
@@ -639,8 +666,10 @@ export async function signWithWallet(
     );
   }
   // Each attempt starts clean: a later unrelated failure must never display a
-  // stale diagnostic from a previous attempt.
+  // stale diagnostic or a previous attempt's wire bytes.
   lastWalletReturnDiagnostic = null;
+  lastProofDiagnostic = null;
+  lastWireBase58 = null;
   let returned: unknown;
   try {
     returned = await wallet.signTransaction(transaction);
@@ -676,11 +705,18 @@ export async function signWithWallet(
     }
     const signedTx = normalized.tx;
 
+    // Capture the wire bytes ONCE per attempt — as soon as the wallet's return
+    // is usable, BEFORE any verdict. Success paths return them; a REJECT
+    // attaches them to the failure (wireSuffix / describeSignFailure) so the
+    // real device payload can be decoded offline without another wallet tap.
+    const wireBase58 = safeWireBase58(signedTx);
+    lastWireBase58 = wireBase58;
+
     // ── Path 1: byte-exact match with what we simulated (desktop norm). ──
     if (proveSignedTransaction(signedTx, expectedMessageBytes)) {
       lastWalletReturnDiagnostic = null;
       lastProofDiagnostic = null;
-      return { tx: signedTx, acceptedVia: "byte_exact", wireBase58: bs58.encode(signedTx.serialize()) };
+      return { tx: signedTx, acceptedVia: "byte_exact", wireBase58: wireBase58 ?? undefined };
     }
 
     // ── Path 2: wallet-mutation allowlist (see evaluatePhantomMutation). ──
@@ -695,19 +731,19 @@ export async function signWithWallet(
       lastProofDiagnostic = `wallet signature INVALID over returned message | ${report}`;
       throw makeSignFailure(
         "no_signature_returned",
-        `The wallet's signature does not verify over the transaction it returned. Nothing was signed or submitted. Structural report: ${report}`,
+        `The wallet's signature does not verify over the transaction it returned. Nothing was signed or submitted. Structural report: ${report}${wireSuffix(wireBase58)}`,
       );
     }
     if (verdict !== "allow") {
       lastProofDiagnostic = `mutation REJECTED | ${report}`;
       throw makeSignFailure(
         "no_signature_returned",
-        `The wallet returned a transaction modified beyond the accepted safety allowlist. Nothing was signed or submitted. Structural report: ${report}`,
+        `The wallet returned a transaction modified beyond the accepted safety allowlist. Nothing was signed or submitted. Structural report: ${report}${wireSuffix(wireBase58)}`,
       );
     }
     lastWalletReturnDiagnostic = null;
     lastProofDiagnostic = null;
-    return { tx: signedTx, acceptedVia: "phantom_allowlist", mutationReport: report, wireBase58: bs58.encode(signedTx.serialize()) };
+    return { tx: signedTx, acceptedVia: "phantom_allowlist", mutationReport: report, wireBase58: wireBase58 ?? undefined };
   } catch (e) {
     if (e instanceof Error && (e as SignFailure).reason) throw e; // already typed
     // Normalization/parse failure of the resolved value.

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import bs58 from "bs58";
 import {
   Transaction,
   VersionedTransaction,
@@ -993,6 +994,82 @@ describe("Phantom-mutation allowlist (device-observed mutation, strict)", () => 
     await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
       reason: "no_signature_returned",
     });
+  });
+
+  it("REJECT failure message embeds the exact wire bytes for offline delta analysis", async () => {
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      // Reallocate (allowlisted) + MemoTransfer.Enable (rejected op).
+      t.instructions.splice(2, 0,
+        new TransactionInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+          data: Buffer.from([29, 0, 0]),
+        }),
+        new TransactionInstruction({
+          programId: TOKEN_2022_PROGRAM_ID,
+          keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+          data: Buffer.from([30, 1]),
+        }),
+      );
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    let message = "";
+    try {
+      await signWithWallet(new Transaction(), wallet, expected, CTX);
+      throw new Error("should have thrown");
+    } catch (e) {
+      message = e instanceof Error ? e.message : "";
+    }
+    expect(message).toContain("Structural report:");
+    expect(message).toContain("REJECT");
+    // The failure carries the wallet's own serialized return (public wire data).
+    const wire = bs58.encode(returned.serialize());
+    expect(message).toContain(`wire=${wire}`);
+  });
+
+  it("describeSignFailure exposes the captured wire after a REJECT (UI path)", async () => {
+    resetWalletReturnDiagnostic();
+    const { tx, expected } = buildSimulated();
+    const returned = walletReturns(tx, (t) => {
+      t.instructions.splice(2, 0, new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }],
+        data: Buffer.from([30, 1]), // MemoTransferExtension.Enable → REJECT
+      }));
+    });
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => returned as unknown as Transaction,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+    // The UI calls describeSignFailure with only the reason — the wire must be there.
+    const text = describeSignFailure("no_signature_returned");
+    const wire = bs58.encode(returned.serialize());
+    expect(text).toContain(`wire=${wire}`);
+    expect(text.trim().endsWith(wire)).toBe(true); // wire last → trivial to copy
+    // A fresh attempt clears the previous wire capture.
+    resetWalletReturnDiagnostic();
+    expect(describeSignFailure("no_signature_returned")).not.toContain("wire=");
+  });
+
+  it("REJECT still ships without wire when serialization is unavailable (fail-open on diagnostics only)", async () => {
+    const { expected } = buildSimulated();
+    // Unusable post-resolve value → normalization failure; wire never existed.
+    const wallet = {
+      publicKey: { toBase58: () => payer.publicKey.toBase58() },
+      signTransaction: async () => ({ totally: "unexpected" }) as never,
+    };
+    await expect(signWithWallet(new Transaction(), wallet, expected, CTX)).rejects.toMatchObject({
+      reason: "no_signature_returned",
+    });
+    expect(describeSignFailure("no_signature_returned")).not.toContain("wire=");
+    resetWalletReturnDiagnostic();
   });
 
   it("byte-exact return still takes path 1 (acceptedVia=byte_exact)", async () => {
