@@ -1,6 +1,7 @@
 import { useQuery, useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { motion, AnimatePresence } from "framer-motion";
+import { Link } from "react-router";
 import {
   getAssociatedTokenAddressSync,
   TOKEN_2022_PROGRAM_ID,
@@ -755,20 +756,29 @@ export default function AppPage() {
     <main className="min-h-dvh bg-gradient-to-b from-background to-secondary/40">
       <div className="mx-auto flex min-h-dvh w-full max-w-md flex-col px-4 pb-10">
         <header className="flex items-center justify-between gap-3 py-4">
-          <div className="min-w-0">
+          {/* Brand links explicitly to the public landing page (never history-back). */}
+          <Link to="/" className="min-w-0 shrink hover:opacity-80 transition-opacity" aria-label="ReynaLens home">
             <h1 className="text-lg font-semibold tracking-tight">ReynaLens</h1>
             <p className="truncate text-xs text-muted-foreground">
               Send exactly what you mean.
             </p>
+          </Link>
+          <div className="flex shrink-0 items-center gap-2">
+            <Link
+              to="/"
+              className="rounded-full border bg-card px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              ← Home
+            </Link>
+            <WalletControl
+              connected={connected}
+              connecting={connecting}
+              address={walletAddress}
+              available={availableWallets}
+              onConnect={connectWallet}
+              onDisconnect={disconnectWallet}
+            />
           </div>
-          <WalletControl
-            connected={connected}
-            connecting={connecting}
-            address={walletAddress}
-            available={availableWallets}
-            onConnect={connectWallet}
-            onDisconnect={disconnectWallet}
-          />
         </header>
 
         <AnimatePresence mode="wait">
